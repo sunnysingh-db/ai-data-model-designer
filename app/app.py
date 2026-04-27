@@ -563,6 +563,14 @@ RULES:
 4. Be CONCISE in descriptions (15 words max each).
 5. Use action-verb relationship descriptions.
 6. Normalize data types to: STRING, LONG, DOUBLE, DATE, BOOLEAN, TIMESTAMP.
+7. ALWAYS include a dim_date conformed dimension if ANY source table has DATE or TIMESTAMP columns.
+   dim_date MUST include at minimum these columns (all source="generated"):
+   - date_key (LONG, PK, YYYYMMDD surrogate key)
+   - full_date (DATE)
+   - year (LONG), quarter (STRING, e.g. "Q1"), month (LONG), month_name (STRING)
+   - week_of_year (LONG), day (LONG), day_of_week (STRING), day_of_year (LONG)
+   - is_weekend (BOOLEAN), is_month_end (BOOLEAN)
+   Link every DATE/TIMESTAMP FK in fact tables to dim_date.date_key.
 
 PROFILING DATA:
 {payload}
@@ -626,6 +634,14 @@ RULES:
 3. Every FK must reference a valid PK in another proposed table.
 4. Be CONCISE in descriptions (15 words max each).
 5. Normalize data types to: STRING, LONG, DOUBLE, DATE, BOOLEAN, TIMESTAMP.
+6. ALWAYS include a dim_date conformed dimension if ANY source table has DATE or TIMESTAMP columns.
+   dim_date MUST include at minimum these columns (all source="generated"):
+   - date_key (LONG, PK, YYYYMMDD surrogate key)
+   - full_date (DATE)
+   - year (LONG), quarter (STRING, e.g. "Q1"), month (LONG), month_name (STRING)
+   - week_of_year (LONG), day (LONG), day_of_week (STRING), day_of_year (LONG)
+   - is_weekend (BOOLEAN), is_month_end (BOOLEAN)
+   Link every DATE/TIMESTAMP FK in fact tables to dim_date.date_key.
 
 PROFILING DATA:
 {payload}
@@ -1412,13 +1428,30 @@ def _generate_consulting_report(model):
 
     m = _deep(model)
 
+    # Load Databricks logo path for PDF footer
+    _db_logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "db-log.png")
+
     class Report(FPDF):
         def footer(self):
-            self.set_y(-10)
+            self.set_y(-14)
             self.set_font("Helvetica", "", 7)
             self.set_text_color(160, 160, 160)
-            self.cell(0, 5, f"AI Data Model Designer  |  Confidential", align="L")
-            self.cell(0, 5, f"Page {self.page_no()}", align="R")
+            # Left: app name
+            self.cell(90, 5, "AI Data Model Designer  |  Confidential", align="L")
+            # Center: Powered by Databricks logo
+            try:
+                _logo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "db-log.png")
+                cx = (self.w / 2) - 22
+                self.set_xy(cx, self.h - 14)
+                self.set_font("Helvetica", "", 7)
+                self.set_text_color(160, 160, 160)
+                self.cell(20, 5, "Powered by")
+                self.image(_logo, x=cx + 20, y=self.h - 13.5, h=4)
+            except Exception:
+                pass
+            # Right: page number
+            self.set_xy(self.w - 18 - 20, self.h - 14)
+            self.cell(20, 5, f"Page {self.page_no()}", align="R")
 
     pdf = Report("L", "mm", "A4")
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -2050,6 +2083,14 @@ app.layout = html.Div(
         ),
 
 
+        # Powered by Databricks footer
+        html.Div(
+            [
+                html.Span("Powered by"),
+                html.Img(src="/assets/db-log.png", style={"height": "22px"}),
+            ],
+            className="powered-footer",
+        ),
 
         # Auto-fit script
         html.Script("""

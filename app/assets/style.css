@@ -326,3 +326,28 @@
 .role-fk { background: #dbeafe; color: #1d4ed8; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
 .role-measure { background: #dcfce7; color: #15803d; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
 .role-attr { background: #f1f5f9; color: #475569; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+
+/* ===== Powered by Databricks Footer ===== */
+.powered-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 14px 24px;
+  background: #f8fafc;
+  border-top: 1px solid #e2e8f0;
+  font-size: 13px;
+  color: #94a3b8;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+}
+
+.powered-footer img {
+  height: 22px;
+  opacity: 0.75;
+  transition: opacity 0.2s;
+}
+
+.powered-footer img:hover {
+  opacity: 1;
+}
