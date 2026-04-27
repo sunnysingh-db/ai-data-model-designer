@@ -1,0 +1,6 @@
+dash>=2.14.0
+dash-cytoscape>=1.0.0
+databricks-sdk>=0.20.0
+pandas>=1.5.0
+pyyaml>=6.0
+fpdf2>=2.7.0
