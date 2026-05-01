@@ -2,7 +2,7 @@
 # AI Data Model Designer — Main Application
 # =============================================================================
 # A Databricks App (Dash/Cytoscape) that analyzes Unity Catalog schemas
-# and proposes optimized star/snowflake dimensional models using LLM.
+# and proposes normalized 3NF relational Entity-Relationship models using LLM.
 # =============================================================================
 
 import os
@@ -42,8 +42,8 @@ _LLM_REFRESH_INTERVAL = 300  # re-discover every 5 minutes
 
 # Tuning parameters
 PROFILE_WORKERS = 20
-LLM_WORKERS = 12
-LLM_GROUP_SIZE = 5
+LLM_WORKERS = 20
+LLM_GROUP_SIZE = 3
 API_TIMEOUT = 300
 MAX_TOKENS_SINGLE = 32000
 MAX_TOKENS_GROUP = 16000
@@ -52,14 +52,13 @@ POLL_INTERVAL_MS = 1200
 
 # Color scheme
 COLORS = {
-    "fact": "#2563eb",
-    "dimension": "#16a34a",
-    "bridge": "#ea580c",
-    "aggregate": "#7c3aed",
-    "pk": "#eab308",
-    "fk": "#2563eb",
-    "measure": "#16a34a",
-    "attribute": "#94a3b8",
+    "core_entity": "#1e3a8a",   # Dark Blue
+    "weak_entity": "#0ea5e9",   # Light Blue
+    "associative": "#f97316",   # Orange
+    "reference": "#64748b",     # Gray
+    "pk": "#eab308",            # Gold
+    "fk": "#2563eb",            # Blue
+    "attribute": "#94a3b8",     # Gray
 }
 
 # Thread-local storage for auth tokens
@@ -142,6 +141,52 @@ def _refresh_endpoints_if_stale():
         _discover_endpoints()
 
 
+def _get_model_pools():
+    """Return tiered model pools: Sonnet for Map, Opus for Reduce.
+
+    Map pool:  Only the LATEST Sonnet endpoint(s) — older versions go to fallback.
+    Reduce pool: Latest Opus endpoints (high intelligence for cross-entity reasoning).
+
+    Fallback: Map falls back to older Sonnet → Opus → Haiku.
+              Reduce falls back to Sonnet → Haiku.
+
+    LLM_FALLBACK_CHAIN is pre-sorted: within each tier, latest version first.
+    """
+    _refresh_endpoints_if_stale()
+
+    opus_models = [m for m in LLM_FALLBACK_CHAIN if "opus" in m.lower()]
+    sonnet_models = [m for m in LLM_FALLBACK_CHAIN if "sonnet" in m.lower()]
+    haiku_models = [m for m in LLM_FALLBACK_CHAIN if "haiku" in m.lower()]
+
+    # --- Map pool: ONLY latest-version Sonnet ---
+    # sonnet_models is already sorted latest-first by _discover_endpoints().
+    # Extract the version of the first (latest) Sonnet, then take all with that version.
+    # e.g. [sonnet-4-5] is latest → only use sonnet-4-5, not sonnet-4-1 or sonnet-3-7.
+    map_latest = []
+    if sonnet_models:
+        _latest = sonnet_models[0]
+        # Extract version signature: e.g. "sonnet-4-5" → ("4","5")
+        _ver = re.findall(r"(\d+)", _latest.lower().split("sonnet")[-1])
+        _latest_ver = tuple(_ver)
+        for m in sonnet_models:
+            m_ver = tuple(re.findall(r"(\d+)", m.lower().split("sonnet")[-1]))
+            if m_ver == _latest_ver:
+                map_latest.append(m)
+    map_primary = map_latest if map_latest else opus_models[:3]
+    # Fallback: older Sonnet → Opus → Haiku
+    older_sonnet = [m for m in sonnet_models if m not in map_primary]
+    map_fallback = older_sonnet + [m for m in opus_models + haiku_models if m not in map_primary]
+
+    # --- Reduce pool: latest Opus (up to 3 for racing) ---
+    reduce_primary = opus_models[:3] if opus_models else sonnet_models[:3]
+    reduce_fallback = [m for m in sonnet_models + haiku_models if m not in reduce_primary]
+
+    return {
+        "map": {"primary": map_primary, "fallback": map_fallback},
+        "reduce": {"primary": reduce_primary, "fallback": reduce_fallback},
+    }
+
+
 try:
     _discover_endpoints()
 except Exception as _e:
@@ -217,7 +262,8 @@ def run_sql(stmt, params=None, token=None):
         raise RuntimeError(f"SQL failed ({state}): {err_msg}")
 
     cols = [c.name for c in resp.manifest.schema.columns]
-    return [dict(zip(cols, row)) for row in resp.result.data_array]
+    data = resp.result.data_array if resp.result and resp.result.data_array else []
+    return [dict(zip(cols, row)) for row in data]
 
 
 # =============================================================================
@@ -246,9 +292,11 @@ def _call_chat_model(prompt, token, max_tokens=MAX_TOKENS_SINGLE, model_chain=No
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
         }
-        print(f"[LLM] → {_short_model(model)} | prompt={len(prompt):,} chars | max_tokens={max_tokens}", flush=True)
+        is_opus = "opus" in model.lower()
+        max_attempts = 3 if is_opus else 2  # Opus gets extra retry
+        print(f"[LLM] → {_short_model(model)} | prompt={len(prompt):,} chars | max_tokens={max_tokens} | attempts={max_attempts}", flush=True)
 
-        for attempt in range(2):  # Max 1 retry per model
+        for attempt in range(max_attempts):
             try:
                 resp = requests.post(url, json=payload, headers=headers, timeout=API_TIMEOUT)
                 if resp.status_code == 200:
@@ -258,17 +306,27 @@ def _call_chat_model(prompt, token, max_tokens=MAX_TOKENS_SINGLE, model_chain=No
                     print(f"[LLM] ← {_short_model(model)} | {len(content_text):,} chars | {elapsed:.1f}s", flush=True)
                     return content_text
                 elif resp.status_code == 429:
-                    print(f"[LLM] ⚠ {_short_model(model)} → 429 rate limited (attempt {attempt+1}/2)", flush=True)
-                    if attempt == 0:
-                        time.sleep(15)
+                    backoff = min(15 * (2 ** attempt), 60)  # 15s, 30s, 60s
+                    print(f"[LLM] ⚠ {_short_model(model)} → 429 rate limited, backoff {backoff}s (attempt {attempt+1}/{max_attempts})", flush=True)
+                    if attempt < max_attempts - 1:
+                        time.sleep(backoff)
                         continue
-                    last_error = f"429 rate limited on {model}"
+                    last_error = f"429 rate limited on {model} after {max_attempts} attempts"
                     break
                 elif resp.status_code in (500, 502, 503):
                     print(f"[LLM] ⚠ {_short_model(model)} → {resp.status_code} service error, trying next...", flush=True)
                     last_error = f"{resp.status_code} on {model}"
                     break  # Fall to next model
-                elif resp.status_code in (400, 401, 403):
+                elif resp.status_code == 400:
+                    # Check if it's a payload size issue (context length exceeded)
+                    err_text = resp.text[:500].lower()
+                    prompt_large = len(prompt) > 100_000  # >100K chars likely exceeds context
+                    size_keywords = ("too long", "context length", "token", "maximum", "too large",
+                                     "max_tokens", "content_length", "length exceeded", "input too")
+                    if prompt_large or any(k in err_text for k in size_keywords):
+                        raise OverflowError(f"Payload too large for {model} ({len(prompt):,} chars): {resp.text[:150]}")
+                    raise RuntimeError(f"400 on {model}: {resp.text[:200]}")
+                elif resp.status_code in (401, 403):
                     raise RuntimeError(f"{resp.status_code} on {model}: {resp.text[:200]}")
                 else:
                     print(f"[LLM] ✗ {_short_model(model)} → {resp.status_code}", flush=True)
@@ -299,16 +357,16 @@ def _call_chat_model_race(prompt, token, max_tokens=MAX_TOKENS_SINGLE, use_model
     if not LLM_FALLBACK_CHAIN:
         raise RuntimeError("No LLM endpoints configured")
 
-    # Select models: explicit list, or top 3 Opus by default
+    # Select models: explicit list, or top 3 Opus by default (for Reduce phase)
     if use_models:
         race_models = use_models
     else:
-        opus_models = [m for m in LLM_FALLBACK_CHAIN if "opus" in m.lower()]
-        race_models = opus_models[:2] if opus_models else LLM_FALLBACK_CHAIN[:2]
+        pools = _get_model_pools()
+        race_models = pools["reduce"]["primary"]  # Top 3 Opus for racing
 
     _short = lambda m: m.replace("databricks-claude-", "")
     ep_names = [_short(m) for m in race_models]
-    print(f"[RACE] 🏁 Racing {len(race_models)} Opus endpoints: {', '.join(ep_names)} | prompt={len(prompt):,} chars", flush=True)
+    print(f"[RACE] 🏁 Racing {len(race_models)} endpoints: {', '.join(ep_names)} | prompt={len(prompt):,} chars", flush=True)
     _race_t0 = time.time()
 
     # Background timer — updates modal every 10s so user sees progress
@@ -513,8 +571,35 @@ def _profile_schema(catalog, schema, token):
             completed += 1
 
     _add_step(f"Profiled {len(profiles)} tables ({total_cols} columns, {total_rows:,} total rows)", status="done")
-    return _build_profiling_payload(profiles, catalog, schema)
+    return profiles, catalog, schema
 
+
+
+def _build_per_table_payloads(profiles, catalog, schema):
+    """Build individual per-table payloads directly from profile dicts.
+
+    Bypasses the monolithic string concatenation + truncation bottleneck.
+    Each table gets its own payload with the schema header prepended.
+    This ensures ALL profiled tables reach the LLM, regardless of total size.
+    """
+    header = f"Schema: `{catalog}`.`{schema}`\n"
+    per_table = {}
+    for p in profiles:
+        tname = p.get("table", "unknown")
+        if p.get("error"):
+            continue  # Skip tables that failed profiling
+        lines = [header]
+        rc = p.get("row_count", "?")
+        lines.append(f"\nTable: {tname} (~{rc:,} rows)" if isinstance(rc, int) else f"\nTable: {tname}")
+        for c in p.get("columns", []):
+            parts = [f"  - {c['name']} ({c['type']}): null={c.get('null_pct', 0)}%, card_ratio={c.get('cardinality_ratio', 0)}"]
+            if c.get("min"):
+                parts.append(f" range=[{c['min']} .. {c.get('max', '?')}]")
+            if c.get("samples"):
+                parts.append(f" samples={c['samples']}")
+            lines.append("".join(parts))
+        per_table[tname] = "\n".join(lines)
+    return per_table
 
 def _build_profiling_payload(profiles, catalog, schema):
     """Build the text payload sent to LLM."""
@@ -546,31 +631,28 @@ def _build_profiling_payload(profiles, catalog, schema):
 
 def _build_system_prompt():
     return (
-        "You are a senior data architect with 20 years of experience in dimensional modeling, "
-        "star schemas, and data warehouse design. You are precise, thorough, and always produce valid JSON."
+        "You are a senior enterprise data architect with 20 years of experience in relational database design, "
+        "3rd Normal Form normalization, and Entity-Relationship modeling. "
+        "You are precise, thorough, and always produce valid JSON."
     )
 
 
 def _build_analysis_prompt(payload, catalog, schema):
     return f"""{_build_system_prompt()}
 
-Analyze the following schema from `{catalog}`.`{schema}` and design an OPTIMAL dimensional model.
+Analyze the following schema from `{catalog}`.`{schema}` and design a strictly normalized 3NF relational model.
 
 RULES:
-1. Do NOT replicate existing tables. REDESIGN them into a proper star/snowflake model.
-2. Use dim_ prefix for dimensions, fact_ for facts, bridge_ for bridges, agg_ for aggregates.
-3. Every FK must reference a valid PK in another proposed table.
+1. Normalize to strict 3rd Normal Form. Eliminate all transitive dependencies.
+2. Classify each entity as exactly ONE of: core_entity, weak_entity, associative, reference.
+   - core_entity: Independent entities with strong PKs (e.g. customers, products, orders)
+   - weak_entity: Entities that depend on a parent for identity (e.g. order_lines, addresses)
+   - associative: Junction tables resolving M:N relationships (e.g. student_courses)
+   - reference: Lookup/code tables with low cardinality, rarely changing (e.g. status_codes, countries)
+3. Column roles must be ONLY: pk or attribute. Do NOT extract FK relationships in this step.
 4. Be CONCISE in descriptions (15 words max each).
-5. Use action-verb relationship descriptions.
-6. Normalize data types to: STRING, LONG, DOUBLE, DATE, BOOLEAN, TIMESTAMP.
-7. ALWAYS include a dim_date conformed dimension if ANY source table has DATE or TIMESTAMP columns.
-   dim_date MUST include at minimum these columns (all source="generated"):
-   - date_key (LONG, PK, YYYYMMDD surrogate key)
-   - full_date (DATE)
-   - year (LONG), quarter (STRING, e.g. "Q1"), month (LONG), month_name (STRING)
-   - week_of_year (LONG), day (LONG), day_of_week (STRING), day_of_year (LONG)
-   - is_weekend (BOOLEAN), is_month_end (BOOLEAN)
-   Link every DATE/TIMESTAMP FK in fact tables to dim_date.date_key.
+5. Normalize data types to: STRING, LONG, DOUBLE, DATE, BOOLEAN, TIMESTAMP.
+6. Do NOT include a "relationships" array — relationships will be determined globally in a later step.
 
 PROFILING DATA:
 {payload}
@@ -579,29 +661,19 @@ Return ONLY valid JSON with this exact structure:
 {{
   "proposed_tables": [
     {{
-      "table_name": "dim_xxx",
-      "table_type": "fact|dimension|bridge|aggregate",
+      "table_name": "entity_name",
+      "table_type": "core_entity|weak_entity|associative|reference",
       "description": "Short description",
       "source_tables": ["original_table"],
       "columns": [
         {{
           "name": "col_name",
           "data_type": "STRING|LONG|DOUBLE|DATE|BOOLEAN|TIMESTAMP",
-          "role": "pk|fk|measure|attribute",
+          "role": "pk|attribute",
           "source": "original_table.column or generated",
           "description": "Short description"
         }}
       ]
-    }}
-  ],
-  "relationships": [
-    {{
-      "from_table": "fact_xxx",
-      "from_column": "key_col",
-      "to_table": "dim_xxx",
-      "to_column": "key_col",
-      "cardinality": "1:N",
-      "description_english": "Each X has many Y"
     }}
   ],
   "columns_dropped": [
@@ -625,23 +697,20 @@ def _build_group_prompt(payload, catalog, schema, all_table_names):
 You are analyzing a SUBSET of tables from `{catalog}`.`{schema}`.
 All tables in the schema: {all_names}
 
-Analyze the following tables and propose dimensional model components.
+Analyze the following tables and propose normalized 3NF entity definitions.
 Note cross-references to tables NOT in this subset — they will be merged later.
 
 RULES:
-1. Do NOT replicate existing tables. REDESIGN them into a proper star/snowflake model.
-2. Use dim_ prefix for dimensions, fact_ for facts, bridge_ for bridges, agg_ for aggregates.
-3. Every FK must reference a valid PK in another proposed table.
+1. Normalize to strict 3rd Normal Form. Eliminate all transitive dependencies.
+2. Classify each entity as exactly ONE of: core_entity, weak_entity, associative, reference.
+   - core_entity: Independent entities with strong PKs (e.g. customers, products, orders)
+   - weak_entity: Entities that depend on a parent for identity (e.g. order_lines, addresses)
+   - associative: Junction tables resolving M:N relationships (e.g. student_courses)
+   - reference: Lookup/code tables with low cardinality, rarely changing (e.g. status_codes, countries)
+3. Column roles must be ONLY: pk or attribute. Do NOT extract FK relationships in this step.
 4. Be CONCISE in descriptions (15 words max each).
 5. Normalize data types to: STRING, LONG, DOUBLE, DATE, BOOLEAN, TIMESTAMP.
-6. ALWAYS include a dim_date conformed dimension if ANY source table has DATE or TIMESTAMP columns.
-   dim_date MUST include at minimum these columns (all source="generated"):
-   - date_key (LONG, PK, YYYYMMDD surrogate key)
-   - full_date (DATE)
-   - year (LONG), quarter (STRING, e.g. "Q1"), month (LONG), month_name (STRING)
-   - week_of_year (LONG), day (LONG), day_of_week (STRING), day_of_year (LONG)
-   - is_weekend (BOOLEAN), is_month_end (BOOLEAN)
-   Link every DATE/TIMESTAMP FK in fact tables to dim_date.date_key.
+6. Do NOT include a "relationships" array — relationships will be determined globally in a later step.
 
 PROFILING DATA:
 {payload}
@@ -650,29 +719,19 @@ Return ONLY valid JSON with this EXACT structure (use these EXACT key names):
 {{
   "proposed_tables": [
     {{
-      "table_name": "dim_xxx",
-      "table_type": "fact|dimension|bridge|aggregate",
+      "table_name": "entity_name",
+      "table_type": "core_entity|weak_entity|associative|reference",
       "description": "Short description",
       "source_tables": ["original_table"],
       "columns": [
         {{
           "name": "col_name",
           "data_type": "STRING|LONG|DOUBLE|DATE|BOOLEAN|TIMESTAMP",
-          "role": "pk|fk|measure|attribute",
+          "role": "pk|attribute",
           "source": "original_table.column or generated",
           "description": "Short description"
         }}
       ]
-    }}
-  ],
-  "relationships": [
-    {{
-      "from_table": "fact_xxx",
-      "from_column": "key_col",
-      "to_table": "dim_xxx",
-      "to_column": "key_col",
-      "cardinality": "1:N",
-      "description_english": "Each X has many Y"
     }}
   ],
   "columns_dropped": [
@@ -689,63 +748,142 @@ Return ONLY valid JSON with this EXACT structure (use these EXACT key names):
 
 
 def _build_merge_prompt(group_results, catalog, schema):
-    combined = json.dumps(group_results, indent=2)
-    return f"""{_build_system_prompt()}
+    """DEPRECATED: LLM-based merge is no longer used. Kept as stub for compatibility."""
+    raise NotImplementedError("LLM merge replaced by programmatic merge + Reduce phase")
 
-You have received multiple partial dimensional model proposals for `{catalog}`.`{schema}`.
-Merge them into a single, unified model.
+
+
+
+# =============================================================================
+# REDUCE PHASE — Global Relationship Mapping (Opus)
+# =============================================================================
+
+def _build_schema_catalog(proposed_tables):
+    """Build a compressed schema catalog from Map phase output.
+
+    Structure-only: table name, type, columns with roles and types.
+    No sample values, no null%, no cardinality — just what Opus needs
+    to infer FK→PK relationships.
+    ~400 chars per table → 200 tables ≈ 80K chars ≈ 20K tokens.
+    """
+    lines = []
+    for t in proposed_tables:
+        tname = t.get("table_name", "unknown")
+        ttype = t.get("table_type", "core_entity")
+        cols = t.get("columns", [])
+        pk_cols = [c["name"] for c in cols if c.get("role", "").lower() == "pk"]
+        attr_cols = [f'{c["name"]} ({c.get("data_type", "STRING")})' for c in cols if c.get("role", "").lower() != "pk"]
+
+        lines.append(f"Entity: {tname} [{ttype}]")
+        if pk_cols:
+            lines.append(f"  PK: {', '.join(pk_cols)}")
+        if attr_cols:
+            lines.append(f"  Attributes: {', '.join(attr_cols)}")
+    return "\n".join(lines)
+
+
+def _build_reduce_prompt(compressed_catalog, catalog, schema):
+    """Build the Reduce phase prompt for global relationship mapping."""
+    return f"""You are an Enterprise Data Architect specializing in relational integrity.
+
+I am providing a complete normalized 3NF schema catalog for `{catalog}`.`{schema}`.
+Each entity lists its columns and Primary Keys.
+
+Your ONLY task: analyze this catalog and identify EVERY foreign key relationship.
+For each FK, specify which column in the child table references which PK in the parent table.
 
 RULES:
-1. Deduplicate tables that appear in multiple groups.
-2. Add cross-group relationships where FKs reference tables from other groups.
-3. Ensure every FK references a valid PK in a proposed table.
-4. Write a unified data_summary (3-4 sentences).
-5. Combine all recommended_consumers (deduplicated).
-6. Combine all columns_dropped.
+1. Every FK MUST reference an existing PK in the catalog.
+2. Do NOT invent columns — only use columns that exist in the catalog.
+3. Include cardinality (1:1, 1:N, M:N).
+4. Use action-verb descriptions (e.g., "Each order belongs to one customer").
+5. Ensure no cross-entity relationship is missed.
+6. For associative (junction) tables, there should be at least 2 FK relationships.
 
-GROUP PROPOSALS:
-{combined}
+SCHEMA CATALOG:
+{compressed_catalog}
 
-Return ONLY valid JSON with this EXACT structure (use these EXACT key names — do NOT rename fields):
+Return ONLY valid JSON:
 {{
-  "proposed_tables": [
-    {{
-      "table_name": "dim_xxx",
-      "table_type": "fact|dimension|bridge|aggregate",
-      "description": "Short description",
-      "source_tables": ["original_table"],
-      "columns": [
-        {{
-          "name": "col_name",
-          "data_type": "STRING|LONG|DOUBLE|DATE|BOOLEAN|TIMESTAMP",
-          "role": "pk|fk|measure|attribute",
-          "source": "original_table.column or generated",
-          "description": "Short description"
-        }}
-      ]
-    }}
-  ],
   "relationships": [
     {{
-      "from_table": "fact_xxx",
-      "from_column": "key_col",
-      "to_table": "dim_xxx",
-      "to_column": "key_col",
+      "from_table": "child_entity",
+      "from_column": "fk_column",
+      "to_table": "parent_entity",
+      "to_column": "pk_column",
       "cardinality": "1:N",
-      "description_english": "Each X has many Y"
+      "description_english": "Each X belongs to one Y"
     }}
-  ],
-  "columns_dropped": [
-    {{
-      "source_table": "table",
-      "column": "col",
-      "reason": "why dropped"
-    }}
-  ],
-  "data_summary": "3-4 sentences summarizing the data domain and model rationale.",
-  "recommended_consumers": ["Analytics Team", "Finance"]
+  ]
 }}
-"""
+
+Return ONLY the JSON. No markdown fences. No extra text."""
+
+
+def _map_global_relationships(proposed_tables, catalog, schema, token):
+    """Reduce phase: Use Opus to infer all FK→PK relationships globally.
+
+    Takes the merged Map output (all proposed entities), compresses it
+    into a structure-only catalog, and sends to Opus via race mode.
+    Returns the relationships list and injects FK roles into columns.
+    """
+    # Build compressed catalog
+    catalog_text = _build_schema_catalog(proposed_tables)
+    print(f"[REDUCE] Schema catalog: {len(catalog_text):,} chars for {len(proposed_tables)} entities", flush=True)
+
+    # Build prompt
+    prompt = _build_reduce_prompt(catalog_text, catalog, schema)
+    print(f"[REDUCE] Prompt: {len(prompt):,} chars", flush=True)
+
+    # Race all Opus endpoints
+    raw = _call_chat_model_race(prompt, token, max_tokens=MAX_TOKENS_SINGLE)
+
+    # Parse relationships
+    parsed = _parse_llm_json_relationships(raw)
+    rels = parsed.get("relationships", []) if parsed else []
+
+    # Validate: drop relationships pointing to non-existent tables/columns
+    valid_tables = {t.get("table_name", ""): {c["name"] for c in t.get("columns", [])} for t in proposed_tables}
+    validated = []
+    for r in rels:
+        ft = r.get("from_table", "")
+        fc = r.get("from_column", "")
+        tt = r.get("to_table", "")
+        tc = r.get("to_column", "")
+        if ft in valid_tables and tt in valid_tables:
+            if fc in valid_tables[ft] and tc in valid_tables[tt]:
+                validated.append(r)
+            else:
+                print(f"[REDUCE] ⚠ Dropped rel: {ft}.{fc} → {tt}.{tc} (column not found)", flush=True)
+        else:
+            print(f"[REDUCE] ⚠ Dropped rel: {ft} → {tt} (table not found)", flush=True)
+
+    print(f"[REDUCE] ✅ {len(validated)} valid relationships (dropped {len(rels) - len(validated)})", flush=True)
+    return validated
+
+
+def _parse_llm_json_relationships(raw):
+    """Parse LLM response JSON specifically for the Reduce phase relationships output."""
+    if not raw:
+        return None
+    text = raw.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    text = text[start:end + 1]
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            text = re.sub(r",\s*}", "}", text)
+            text = re.sub(r",\s*]", "]", text)
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+    return data
 
 
 # =============================================================================
@@ -753,9 +891,9 @@ Return ONLY valid JSON with this EXACT structure (use these EXACT key names — 
 # =============================================================================
 
 def _analyze_single_pass(payload, catalog, schema, token):
-    """For small schemas: single Opus call with fallback chain. No racing = zero waste."""
-    opus_models = [m for m in LLM_FALLBACK_CHAIN if "opus" in m.lower()]
-    model_chain = opus_models[:2] if opus_models else LLM_FALLBACK_CHAIN[:2]
+    """For small schemas: single Sonnet call with fallback chain. No racing = zero waste."""
+    pools = _get_model_pools()
+    model_chain = pools["map"]["primary"] + pools["map"]["fallback"]
     _short = lambda m: m.replace("databricks-claude-", "")
     ep_names = [_short(m) for m in model_chain]
     prompt = _build_analysis_prompt(payload, catalog, schema)
@@ -786,16 +924,18 @@ def _analyze_single_pass(payload, catalog, schema, token):
 
 
 def _analyze_groups(payload_per_table, catalog, schema, token, all_table_names, group_size=None):
-    """Distribute table groups across Opus endpoints in parallel.
+    """Distribute table groups across Sonnet endpoints in parallel (Map phase).
 
     group_size: dynamic — calculated to maximize parallelism across endpoints.
-    Each group assigned to a specific Opus endpoint (round-robin).
-    Every API call does productive work — zero wasted compute.
+    Each group assigned to a specific Sonnet endpoint (round-robin).
+    Sonnet: fast, cheap — ideal for structured entity extraction.
+    Opus reserved for the global Reduce phase.
     """
     _short = lambda m: m.replace("databricks-claude-", "")
-    opus_models = [m for m in LLM_FALLBACK_CHAIN if "opus" in m.lower()]
-    work_models = opus_models[:2] if opus_models else LLM_FALLBACK_CHAIN[:2]
-    n_eps = len(work_models)
+    pools = _get_model_pools()
+    work_models = pools["map"]["primary"]
+    map_fallback = pools["map"]["fallback"]
+    n_eps = len(work_models) if work_models else 1
 
     # Dynamic group size: spread evenly across endpoints for max parallelism
     import math
@@ -832,18 +972,47 @@ def _analyze_groups(payload_per_table, catalog, schema, token, all_table_names, 
 
     def _analyze_one_group(group_tables, endpoint_idx):
         ep = work_models[endpoint_idx % n_eps]
-        # Fallback to other Opus if primary fails
-        fallback = [m for m in work_models if m != ep] + [m for m in LLM_FALLBACK_CHAIN if m not in work_models]
+        # Fallback: other Sonnet first, then Opus, then Haiku
+        other_primary = [m for m in work_models if m != ep]
+        fallback = other_primary + map_fallback
         _g_t0 = time.time()
         group_payload = "\n".join(payload_per_table[t] for t in group_tables if t in payload_per_table)
         prompt = _build_group_prompt(group_payload, catalog, schema, all_table_names)
         print(f"[GROUP] ▶ Group {endpoint_idx+1} started → {_short(ep)} | {len(group_tables)} tables | prompt={len(prompt):,} chars", flush=True)
-        result = _call_chat_model(prompt, token, MAX_TOKENS_GROUP, model_chain=[ep] + fallback)
+
+        try:
+            result = _call_chat_model(prompt, token, MAX_TOKENS_GROUP, model_chain=[ep] + fallback)
+        except OverflowError as oe:
+            # Payload too large for the group — split into individual table calls
+            print(f"[GROUP] ⚠ Group {endpoint_idx+1} too large ({len(prompt):,} chars). Splitting into {len(group_tables)} individual calls...", flush=True)
+            sub_results = []
+            for tbl in group_tables:
+                if tbl not in payload_per_table:
+                    continue
+                sub_prompt = _build_group_prompt(payload_per_table[tbl], catalog, schema, all_table_names)
+                try:
+                    sub_result = _call_chat_model(sub_prompt, token, MAX_TOKENS_GROUP, model_chain=[ep] + fallback)
+                    sub_results.append(sub_result)
+                    print(f"[GROUP] ✓ Split table {tbl} done ({len(sub_result):,} chars)", flush=True)
+                except Exception as sub_e:
+                    print(f"[GROUP] ✗ Split table {tbl} failed: {sub_e}", flush=True)
+            # Merge sub-results into a single JSON response
+            if sub_results:
+                merged_tables = []
+                for sr in sub_results:
+                    parsed = _parse_llm_json(sr)
+                    if parsed:
+                        merged_tables.extend(parsed.get("proposed_tables", []))
+                result = json.dumps({"proposed_tables": merged_tables, "relationships": [], "columns_dropped": []})
+                print(f"[GROUP] ✓ Group {endpoint_idx+1} recovered via split — {len(merged_tables)} tables", flush=True)
+            else:
+                raise RuntimeError(f"Group {endpoint_idx+1} failed: all split calls failed after payload overflow")
+
         elapsed = time.time() - _g_t0
         print(f"[GROUP] ✓ Group {endpoint_idx+1} done → {_short(ep)} | {len(result):,} chars | {elapsed:.1f}s", flush=True)
         return result, endpoint_idx
 
-    _add_step(f"⏳ {len(groups)} Opus calls running in parallel...")
+    _add_step(f"⏳ {len(groups)} Sonnet calls running in parallel (Map phase)...")
 
     with ThreadPoolExecutor(max_workers=LLM_WORKERS) as pool:
         futures = {
@@ -861,7 +1030,7 @@ def _analyze_groups(payload_per_table, catalog, schema, token, all_table_names, 
                         group_results.append(parsed)
                         print(f"[GROUP] ✓ Group {gidx+1} parsed: {n_tables} tables proposed", flush=True)
             except Exception as e:
-                ep = LLM_FALLBACK_CHAIN[idx % n_eps] if LLM_FALLBACK_CHAIN else "?"
+                ep = work_models[idx % n_eps] if work_models else "?"
                 group_errors.append(f"Group {idx+1} ({_short(ep)}): {str(e)[:80]}")
                 print(f"[GROUP] ✗ Group {idx+1} FAILED ({_short(ep)}): {e}", flush=True)
             completed += 1
@@ -995,26 +1164,25 @@ def _parse_llm_json(raw):
     if "proposed_tables" not in data:
         return None
 
-    # Normalize table types
-    valid_types = {"fact", "dimension", "bridge", "aggregate"}
+    # Normalize table types (3NF entity types)
+    valid_types = {"core_entity", "weak_entity", "associative", "reference"}
     for t in data.get("proposed_tables", []):
         tt = t.get("table_type", "").lower()
         if tt not in valid_types:
-            if "fact" in t.get("table_name", "").lower():
-                t["table_type"] = "fact"
-            elif "dim" in t.get("table_name", "").lower():
-                t["table_type"] = "dimension"
-            elif "bridge" in t.get("table_name", "").lower():
-                t["table_type"] = "bridge"
-            elif "agg" in t.get("table_name", "").lower():
-                t["table_type"] = "aggregate"
+            name = t.get("table_name", "").lower()
+            if "assoc" in name or "bridge" in name or "link" in name or "junction" in name:
+                t["table_type"] = "associative"
+            elif "ref" in name or "lkp" in name or "lookup" in name or "code" in name:
+                t["table_type"] = "reference"
+            elif "_dep" in name or "detail" in name or "line" in name:
+                t["table_type"] = "weak_entity"
             else:
-                t["table_type"] = "dimension"
+                t["table_type"] = "core_entity"
         else:
             t["table_type"] = tt
 
-        # Normalize column roles
-        valid_roles = {"pk", "fk", "measure", "attribute"}
+        # Normalize column roles (3NF: no "measure" role)
+        valid_roles = {"pk", "fk", "attribute"}
         for c in t.get("columns", []):
             role = c.get("role", "").lower()
             if role not in valid_roles:
@@ -1077,50 +1245,47 @@ def _bg_generate(catalog, schema, layout, token):
     _tls.token = token
     try:
         # Step 1: Profile
-        payload = _profile_schema(catalog, schema, token)
-        if not payload:
+        profile_result = _profile_schema(catalog, schema, token)
+        if not profile_result:
             _job["error"] = "No tables found in schema"
             _job["active"] = False
             return
+        raw_profiles, prof_catalog, prof_schema = profile_result
 
         _check_cancelled()
 
-        # Step 2: LLM Analysis — ALWAYS distribute across Opus endpoints
-        table_count = payload.count("\nTable: ")
-        opus_models = [m for m in LLM_FALLBACK_CHAIN if "opus" in m.lower()]
-        work_models = opus_models[:2] if opus_models else LLM_FALLBACK_CHAIN[:2]
-        ep_names = [m.replace("databricks-claude-", "") for m in work_models]
-        n_eps = len(work_models)
-        print(f"[GEN] LLM phase: {table_count} tables → distributing across {n_eps} Opus endpoints, payload={len(payload):,} chars", flush=True)
+        # Step 2: LLM Analysis — Map phase uses Sonnet, Reduce phase uses Opus
+        # Build per-table payloads DIRECTLY from profiles (no truncation)
+        per_table = _build_per_table_payloads(raw_profiles, prof_catalog, prof_schema)
+        table_count = len(per_table)
+        total_chars = sum(len(v) for v in per_table.values())
 
-        # Build per-table payloads
-        sections = re.split(r"(?=\nTable: )", payload)
-        header = sections[0] if sections else ""
-        per_table = {}
-        for sec in sections[1:]:
-            match = re.match(r"\nTable: (\S+)", sec)
-            if match:
-                per_table[match.group(1)] = header + sec
+        pools = _get_model_pools()
+        map_models = pools["map"]["primary"]
+        ep_names = [m.replace("databricks-claude-", "") for m in map_models]
+        n_eps = len(map_models) if map_models else 1
+        print(f"[GEN] Map phase: {table_count} tables → distributing across {n_eps} Sonnet endpoints, total payload={total_chars:,} chars", flush=True)
 
-        # Sanity check: did we parse all tables?
-        if len(per_table) < table_count:
-            print(f"[WARN] Parsed {len(per_table)} tables from payload, but profiled {table_count}. Possible truncation.", flush=True)
-            _add_step(f"⚠ Parsed {len(per_table)}/{table_count} tables (payload may have been truncated)", status="error")
+        if table_count == 0:
+            _job["error"] = "No tables could be profiled"
+            _add_step("❌ No tables profiled successfully", status="error")
+            _job["active"] = False
+            return
 
-        if len(per_table) == 1:
+        if table_count == 1:
             # Edge case: only 1 table — direct call, no distribution needed
-            _add_step(f"🧠 Analyzing 1 table via {ep_names[0]} (Opus)")
-            raw_response = _analyze_single_pass(payload, catalog, schema, token)
+            single_payload = list(per_table.values())[0]
+            _add_step(f"🧠 Analyzing 1 table via {ep_names[0]} (Sonnet Map)")
+            raw_response = _analyze_single_pass(single_payload, prof_catalog, prof_schema, token)
         else:
-            # 1 table per API call = maximum parallelism
-            # Round-robin across Opus endpoints (opus-4-7, opus-4-6, opus-4-7, ...)
-            _add_step(f"⚡ {len(per_table)} parallel LLM calls (1 table each) → round-robin {', '.join(ep_names)}")
-            raw_response = _analyze_groups(per_table, catalog, schema, token, list(per_table.keys()), 1)
+            # Groups of LLM_GROUP_SIZE tables, round-robin across Sonnet endpoints
+            _add_step(f"⚡ {table_count} tables in groups of {LLM_GROUP_SIZE} → Sonnet round-robin {', '.join(ep_names)}")
+            raw_response = _analyze_groups(per_table, prof_catalog, prof_schema, token, list(per_table.keys()))
 
         _check_cancelled()
 
-        # Step 3: Parse
-        _add_step(f"🔍 Parsing LLM response ({len(raw_response):,} chars) — extracting JSON model...")
+        # Step 3: Parse Map output
+        _add_step(f"🔍 Parsing Map response ({len(raw_response):,} chars) — extracting entities...")
         model = _parse_llm_json(raw_response)
         if not model:
             _job["error"] = "Failed to parse LLM response as valid JSON"
@@ -1128,11 +1293,42 @@ def _bg_generate(catalog, schema, layout, token):
             print(f"[PARSE] Failed. First 500 chars: {raw_response[:500]}", flush=True)
         else:
             t_count = len(model.get("proposed_tables", []))
+            col_count = sum(len(t.get("columns", [])) for t in model.get("proposed_tables", []))
+            _add_step(f"✅ Map complete — {t_count} entities, {col_count} columns extracted", status="done")
+            print(f"[PARSE] ✅ Map: {t_count} tables, {col_count} cols", flush=True)
+
+            _check_cancelled()
+
+            # Step 4: Reduce — Global relationship mapping via Opus
+            _add_step(f"🧠 Reduce phase — racing Opus endpoints for global FK→PK mapping...")
+            try:
+                relationships = _map_global_relationships(
+                    model.get("proposed_tables", []), catalog, schema, token
+                )
+                model["relationships"] = relationships
+
+                # Inject FK roles into columns
+                for rel in relationships:
+                    for t in model.get("proposed_tables", []):
+                        if t["table_name"] == rel.get("from_table", ""):
+                            for c in t.get("columns", []):
+                                if c["name"] == rel.get("from_column", ""):
+                                    c["role"] = "fk"
+
+                r_count = len(relationships)
+                _add_step(f"✅ Reduce complete — {r_count} relationships mapped via Opus", status="done")
+                print(f"[REDUCE] ✅ {r_count} relationships injected", flush=True)
+            except Exception as reduce_err:
+                print(f"[REDUCE] ⚠ Reduce phase failed: {reduce_err}", flush=True)
+                _add_step(f"⚠ Reduce failed: {str(reduce_err)[:80]} — model has entities but no relationships", status="error")
+                model.setdefault("relationships", [])
+
+            t_count = len(model.get("proposed_tables", []))
             r_count = len(model.get("relationships", []))
             col_count = sum(len(t.get("columns", [])) for t in model.get("proposed_tables", []))
             _add_step(f"✅ Model ready — {t_count} tables, {r_count} relationships, {col_count} columns", status="done")
             _job["result"] = model
-            print(f"[PARSE] ✅ {t_count} tables, {r_count} rels, {col_count} cols", flush=True)
+            print(f"[FINAL] ✅ {t_count} tables, {r_count} rels, {col_count} cols", flush=True)
 
     except RuntimeError as e:
         if "Cancelled" in str(e):
@@ -1161,7 +1357,7 @@ def build_proposed_erd_elements(model):
     # Nodes — one per proposed table
     for t in model.get("proposed_tables", []):
         tname = t.get("table_name", "unknown")
-        ttype = t.get("table_type", "dimension").lower()
+        ttype = t.get("table_type", "core_entity").lower()
         col_count = len(t.get("columns", []))
         color = COLORS.get(ttype, COLORS["attribute"])
 
@@ -1231,11 +1427,11 @@ def get_cytoscape_stylesheet():
                 "text-max-width": 180,
             },
         },
-        # Fact tables
-        {"selector": ".fact", "style": {"background-color": COLORS["fact"], "border-color": "#1d4ed8"}},
-        {"selector": ".dimension", "style": {"background-color": COLORS["dimension"], "border-color": "#15803d"}},
-        {"selector": ".bridge", "style": {"background-color": COLORS["bridge"], "border-color": "#c2410c"}},
-        {"selector": ".aggregate", "style": {"background-color": COLORS["aggregate"], "border-color": "#6d28d9"}},
+        # 3NF Entity types
+        {"selector": ".core_entity", "style": {"background-color": COLORS["core_entity"], "border-color": "#1e40af"}},
+        {"selector": ".weak_entity", "style": {"background-color": COLORS["weak_entity"], "border-color": "#0284c7"}},
+        {"selector": ".associative", "style": {"background-color": COLORS["associative"], "border-color": "#ea580c"}},
+        {"selector": ".reference", "style": {"background-color": COLORS["reference"], "border-color": "#475569"}},
         # Edges
         {
             "selector": "edge",
@@ -1324,18 +1520,18 @@ def build_summary_panel(model):
 
         rows = []
         for t in tables:
-            ttype = t.get("table_type", "dimension")
+            ttype = t.get("table_type", "core_entity")
             cols = t.get("columns", [])
             pks = sum(1 for c in cols if c.get("role", "").lower() == "pk")
             fks = sum(1 for c in cols if c.get("role", "").lower() == "fk")
-            measures = sum(1 for c in cols if c.get("role", "").lower() == "measure")
+            attrs = sum(1 for c in cols if c.get("role", "").lower() == "attribute")
             sources = ", ".join(t.get("source_tables", []))
             rows.append(html.Tr([
                 html.Td(html.Span(ttype.upper(), className=f"badge badge-{ttype}")),
                 html.Td(t.get("table_name", "?"), style={"fontWeight": "600"}),
                 html.Td(t.get("description", ""), style={"color": "#475569", "fontSize": "13px"}),
                 html.Td(str(len(cols)), style={"textAlign": "center", "fontWeight": "600", "color": "#2563eb"}),
-                html.Td(f"{pks}PK / {fks}FK / {measures}M", style={"fontSize": "12px", "color": "#64748b"}),
+                html.Td(f"{pks}PK / {fks}FK / {attrs}A", style={"fontSize": "12px", "color": "#64748b"}),
                 html.Td(sources, style={"fontSize": "12px", "color": "#64748b"}),
             ]))
 
@@ -1474,13 +1670,13 @@ def _generate_consulting_report(model):
     catalog = m.get("_catalog", "")
     schema = m.get("_schema", "")
     total_cols = sum(len(t.get("columns", [])) for t in tables)
-    type_order = {"fact": 0, "dimension": 1, "bridge": 2, "aggregate": 3}
+    type_order = {"core_entity": 0, "weak_entity": 1, "associative": 2, "reference": 3}
     tables_sorted = sorted(tables, key=lambda t: type_order.get(t.get("table_type", "").lower(), 9))
     type_counts = {}
     for t in tables:
-        tt = t.get("table_type", "dimension").lower()
+        tt = t.get("table_type", "core_entity").lower()
         type_counts[tt] = type_counts.get(tt, 0) + 1
-    CLR = {"fact": (0, 82, 155), "dimension": (0, 128, 80), "bridge": (180, 90, 0), "aggregate": (100, 50, 160)}
+    CLR = {"core_entity": (30, 58, 138), "weak_entity": (14, 165, 233), "associative": (249, 115, 22), "reference": (100, 116, 139)}
 
     # --- McKinsey-style table helper ---
     def draw_table(headers, rows, col_widths, start_y=None, accent=BLUE):
@@ -1599,7 +1795,7 @@ def _generate_consulting_report(model):
     pdf.set_xy(M, 62)
     pdf.set_font("Helvetica", "", 12)
     pdf.set_text_color(*LGRAY)
-    pdf.cell(W, 6, "DIMENSIONAL DATA MODEL")
+    pdf.cell(W, 6, "RELATIONAL DATA MODEL (3NF)")
     pdf.ln(8)
     pdf.set_font("Helvetica", "B", 32)
     pdf.set_text_color(*WHITE)
@@ -1666,7 +1862,7 @@ def _generate_consulting_report(model):
     # ==========================================
     pdf.add_page()
     section_title("02", "Data Model Overview")
-    body_text("The following table inventory summarizes all proposed tables in the dimensional model, "
+    body_text("The following table inventory summarizes all proposed tables in the 3NF relational model, "
               "including type classification, column counts, and source lineage.", 8)
     pdf.ln(2)
 
@@ -1706,7 +1902,7 @@ def _generate_consulting_report(model):
     for ti, t in enumerate(tables_sorted):
         pdf.add_page()
         tname = t.get("table_name", "unknown")
-        ttype = t.get("table_type", "dimension").lower()
+        ttype = t.get("table_type", "core_entity").lower()
         clr = CLR.get(ttype, BLUE)
         cols = t.get("columns", [])
 
@@ -1743,7 +1939,7 @@ def _generate_consulting_report(model):
         pdf.set_text_color(*NAVY)
         pdf.cell(W, 5, "Column Specifications", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(2)
-        rl = {"pk": "PK", "fk": "FK", "measure": "Measure", "attribute": "Attr"}
+        rl = {"pk": "PK", "fk": "FK", "attribute": "Attr"}
         col_rows = [[c.get("name","?"), c.get("data_type","?"),
                       rl.get(c.get("role",""), c.get("role","")),
                       c.get("source","")[:45], c.get("description","")[:80]]
@@ -1757,7 +1953,7 @@ def _generate_consulting_report(model):
     if dropped:
         pdf.add_page()
         section_title("05", "Dropped Columns Analysis")
-        body_text(f"{len(dropped)} columns were excluded from the dimensional model.", 8)
+        body_text(f"{len(dropped)} columns were excluded from the 3NF relational model.", 8)
         pdf.ln(2)
         drop_rows = [[d.get("source_table","?"), d.get("column","?"), d.get("reason","")[:120]]
                       for d in dropped]
@@ -1770,7 +1966,7 @@ def _generate_consulting_report(model):
     pdf.add_page()
     section_title("A", "Appendix: Report Metadata")
     pdf.ln(2)
-    label_value("Report Type:", "Dimensional Data Model Design - Consulting Deliverable")
+    label_value("Report Type:", "Relational Data Model (3NF) Design - Consulting Deliverable")
     label_value("Source Schema:", f"{catalog}.{schema}" if catalog else "N/A")
     label_value("Generated:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     label_value("Proposed Tables:", str(len(tables)))
@@ -2039,14 +2235,14 @@ app.layout = html.Div(
         # Legend bar
         html.Div(
             [
-                html.Span("\u25cf", style={"color": COLORS["fact"], "marginRight": "4px"}),
-                html.Span("Fact", style={"marginRight": "16px"}),
-                html.Span("\u25cf", style={"color": COLORS["dimension"], "marginRight": "4px"}),
-                html.Span("Dimension", style={"marginRight": "16px"}),
-                html.Span("\u25cf", style={"color": COLORS["bridge"], "marginRight": "4px"}),
-                html.Span("Bridge", style={"marginRight": "16px"}),
-                html.Span("\u25cf", style={"color": COLORS["aggregate"], "marginRight": "4px"}),
-                html.Span("Aggregate", style={"marginRight": "16px"}),
+                html.Span("\u25cf", style={"color": COLORS["core_entity"], "marginRight": "4px"}),
+                html.Span("Core Entity", style={"marginRight": "16px"}),
+                html.Span("\u25cf", style={"color": COLORS["weak_entity"], "marginRight": "4px"}),
+                html.Span("Weak Entity", style={"marginRight": "16px"}),
+                html.Span("\u25cf", style={"color": COLORS["associative"], "marginRight": "4px"}),
+                html.Span("Associative", style={"marginRight": "16px"}),
+                html.Span("\u25cf", style={"color": COLORS["reference"], "marginRight": "4px"}),
+                html.Span("Reference", style={"marginRight": "16px"}),
                 html.Div(style={"flex": "1"}),
                 html.Button("Export Report", id="export-btn", className="export-btn", disabled=True),
             ],
@@ -2331,7 +2527,7 @@ def on_node_click(node_data, model):
     if not table_info:
         return no_update
 
-    ttype = table_info.get("table_type", "dimension")
+    ttype = table_info.get("table_type", "core_entity")
     cols = table_info.get("columns", [])
     pks = sum(1 for c in cols if c.get("role", "").lower() == "pk")
 

@@ -118,10 +118,10 @@
   letter-spacing: 0.5px;
 }
 
-.badge-fact { background: #dbeafe; color: #1d4ed8; }
-.badge-dimension { background: #dcfce7; color: #15803d; }
-.badge-bridge { background: #ffedd5; color: #c2410c; }
-.badge-aggregate { background: #ede9fe; color: #6d28d9; }
+.badge-core_entity { background: #1e3a8a; color: white; }
+.badge-weak_entity { background: #0ea5e9; color: white; }
+.badge-associative { background: #f97316; color: white; }
+.badge-reference { background: #64748b; color: white; }
 
 /* ===== Thinking Modal ===== */
 @keyframes pulse {
@@ -324,7 +324,6 @@
 /* ===== Column Role Badges ===== */
 .role-pk { background: #fef3c7; color: #92400e; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
 .role-fk { background: #dbeafe; color: #1d4ed8; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
-.role-measure { background: #dcfce7; color: #15803d; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
 .role-attr { background: #f1f5f9; color: #475569; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
 
 /* ===== Powered by Databricks Footer ===== */
