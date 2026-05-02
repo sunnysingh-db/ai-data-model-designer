@@ -52,12 +52,20 @@ POLL_INTERVAL_MS = 1200
 
 # Color scheme
 COLORS = {
-    "core_entity": "#1e3a8a",   # Dark Blue
-    "weak_entity": "#0ea5e9",   # Light Blue
+    # 3NF entity types
+    "core_entity": "#1e3a8a",   # Dark Navy
+    "weak_entity": "#0ea5e9",   # Sky Blue
     "associative": "#f97316",   # Orange
-    "reference": "#64748b",     # Gray
+    "reference": "#64748b",     # Slate
+    # Dimensional entity types
+    "fact": "#2563eb",          # Blue
+    "dimension": "#16a34a",     # Green
+    "bridge": "#ea580c",        # Deep Orange
+    "aggregate": "#7c3aed",     # Purple
+    # Column roles
     "pk": "#eab308",            # Gold
     "fk": "#2563eb",            # Blue
+    "measure": "#16a34a",       # Green
     "attribute": "#94a3b8",     # Gray
 }
 
@@ -120,8 +128,11 @@ def _discover_endpoints():
                 tier = 3
             # Extract version numbers (e.g. '4-7' → [4,7], '3-5' → [3,5])
             nums = re.findall(r"(\d+)", nl.split("claude")[-1])
-            # Negate for descending sort (higher version first)
-            version = tuple(-int(n) for n in nums) if nums else (0,)
+            # Pad to 3 so sonnet-4 → (-4,0,0) sorts AFTER sonnet-4-6 → (-4,-6,0)
+            padded = [-int(n) for n in nums] if nums else [0]
+            while len(padded) < 3:
+                padded.append(0)
+            version = tuple(padded)
             return (tier, version, name)
 
         candidates.sort(key=_sort_key)
@@ -167,9 +178,14 @@ def _get_model_pools():
         _latest = sonnet_models[0]
         # Extract version signature: e.g. "sonnet-4-5" → ("4","5")
         _ver = re.findall(r"(\d+)", _latest.lower().split("sonnet")[-1])
+        while len(_ver) < 3:
+            _ver.append("0")
         _latest_ver = tuple(_ver)
         for m in sonnet_models:
-            m_ver = tuple(re.findall(r"(\d+)", m.lower().split("sonnet")[-1]))
+            m_ver_raw = re.findall(r"(\d+)", m.lower().split("sonnet")[-1])
+            while len(m_ver_raw) < 3:
+                m_ver_raw.append("0")
+            m_ver = tuple(m_ver_raw)
             if m_ver == _latest_ver:
                 map_latest.append(m)
     map_primary = map_latest if map_latest else opus_models[:3]
@@ -629,7 +645,14 @@ def _build_profiling_payload(profiles, catalog, schema):
 # LLM PROMPTS
 # =============================================================================
 
-def _build_system_prompt():
+def _build_system_prompt(model_type="3nf"):
+    if model_type == "dimensional":
+        return (
+            "You are a senior enterprise data architect with 20 years of experience in dimensional modeling "
+            "using the Kimball methodology. You specialize in star schemas, snowflake schemas, fact tables, "
+            "dimension tables, bridge tables, and aggregate tables. "
+            "You are precise, thorough, and always produce valid JSON."
+        )
     return (
         "You are a senior enterprise data architect with 20 years of experience in relational database design, "
         "3rd Normal Form normalization, and Entity-Relationship modeling. "
@@ -637,12 +660,46 @@ def _build_system_prompt():
     )
 
 
-def _build_analysis_prompt(payload, catalog, schema):
-    return f"""{_build_system_prompt()}
-
-Analyze the following schema from `{catalog}`.`{schema}` and design a strictly normalized 3NF relational model.
-
-RULES:
+def _build_analysis_prompt(payload, catalog, schema, model_type="3nf"):
+    sys = _build_system_prompt(model_type)
+    if model_type == "dimensional":
+        rules = """RULES:
+1. Design using Kimball dimensional modeling: identify facts (measurable business events) and dimensions (descriptive context).
+2. Classify each table as exactly ONE of: fact, dimension, bridge, aggregate.
+   - fact: Central event/transaction tables with measurable metrics (e.g. sales_fact, order_fact)
+   - dimension: Descriptive context tables (e.g. dim_customer, dim_product, dim_date)
+   - bridge: Tables resolving M:N relationships between facts and dimensions (e.g. bridge_customer_group)
+   - aggregate: Pre-aggregated summary tables for performance (e.g. agg_monthly_sales)
+3. ALWAYS include a dim_date dimension if date/time columns exist.
+4. Column roles: pk (primary/surrogate key), measure (numeric additive/semi-additive metrics), attribute (descriptive fields).
+5. Use naming convention: fact_ prefix for facts, dim_ prefix for dimensions, bridge_ for bridges, agg_ for aggregates.
+6. Do NOT include FK relationships — they will be determined globally in a later step.
+7. Be CONCISE in descriptions (15 words max each).
+8. Normalize data types to: STRING, LONG, DOUBLE, DATE, BOOLEAN, TIMESTAMP."""
+        json_tmpl = """{
+  "proposed_tables": [
+    {
+      "table_name": "entity_name",
+      "table_type": "fact|dimension|bridge|aggregate",
+      "description": "Short description",
+      "source_tables": ["original_table"],
+      "columns": [
+        {
+          "name": "col_name",
+          "data_type": "STRING|LONG|DOUBLE|DATE|BOOLEAN|TIMESTAMP",
+          "role": "pk|measure|attribute",
+          "source": "original_table.column or generated",
+          "description": "Short description"
+        }
+      ]
+    }
+  ],
+  "columns_dropped": [{"source_table": "t", "column": "c", "reason": "why"}],
+  "data_summary": "3-4 sentences summarizing the data domain and model rationale."
+}"""
+        intro = f"Analyze the following schema from `{catalog}`.`{schema}` and design a dimensional model (Kimball star schema)."
+    else:
+        rules = """RULES:
 1. Normalize to strict 3rd Normal Form. Eliminate all transitive dependencies.
 2. Classify each entity as exactly ONE of: core_entity, weak_entity, associative, reference.
    - core_entity: Independent entities with strong PKs (e.g. customers, products, orders)
@@ -652,55 +709,85 @@ RULES:
 3. Column roles must be ONLY: pk or attribute. Do NOT extract FK relationships in this step.
 4. Be CONCISE in descriptions (15 words max each).
 5. Normalize data types to: STRING, LONG, DOUBLE, DATE, BOOLEAN, TIMESTAMP.
-6. Do NOT include a "relationships" array — relationships will be determined globally in a later step.
+6. Do NOT include a "relationships" array — relationships will be determined globally in a later step."""
+        json_tmpl = """{
+  "proposed_tables": [
+    {
+      "table_name": "entity_name",
+      "table_type": "core_entity|weak_entity|associative|reference",
+      "description": "Short description",
+      "source_tables": ["original_table"],
+      "columns": [
+        {
+          "name": "col_name",
+          "data_type": "STRING|LONG|DOUBLE|DATE|BOOLEAN|TIMESTAMP",
+          "role": "pk|attribute",
+          "source": "original_table.column or generated",
+          "description": "Short description"
+        }
+      ]
+    }
+  ],
+  "columns_dropped": [{"source_table": "t", "column": "c", "reason": "why"}],
+  "data_summary": "3-4 sentences summarizing the data domain and model rationale."
+}"""
+        intro = f"Analyze the following schema from `{catalog}`.`{schema}` and design a strictly normalized 3NF relational model."
+
+    return f"""{sys}
+
+{intro}
+
+{rules}
 
 PROFILING DATA:
 {payload}
 
 Return ONLY valid JSON with this exact structure:
-{{
-  "proposed_tables": [
-    {{
-      "table_name": "entity_name",
-      "table_type": "core_entity|weak_entity|associative|reference",
-      "description": "Short description",
-      "source_tables": ["original_table"],
-      "columns": [
-        {{
-          "name": "col_name",
-          "data_type": "STRING|LONG|DOUBLE|DATE|BOOLEAN|TIMESTAMP",
-          "role": "pk|attribute",
-          "source": "original_table.column or generated",
-          "description": "Short description"
-        }}
-      ]
-    }}
-  ],
-  "columns_dropped": [
-    {{
-      "source_table": "table",
-      "column": "col",
-      "reason": "why dropped"
-    }}
-  ],
-  "data_summary": "3-4 sentences summarizing the data domain and model rationale.",
-  "recommended_consumers": ["Analytics Team", "Finance"]
-}}
+{json_tmpl}
 
 Return ONLY the JSON. No markdown fences. No extra text."""
 
-
-def _build_group_prompt(payload, catalog, schema, all_table_names):
+def _build_group_prompt(payload, catalog, schema, all_table_names, model_type="3nf"):
     all_names = ", ".join(all_table_names)
-    return f"""{_build_system_prompt()}
-
-You are analyzing a SUBSET of tables from `{catalog}`.`{schema}`.
-All tables in the schema: {all_names}
-
-Analyze the following tables and propose normalized 3NF entity definitions.
-Note cross-references to tables NOT in this subset — they will be merged later.
-
-RULES:
+    sys = _build_system_prompt(model_type)
+    if model_type == "dimensional":
+        rules = """RULES:
+1. Design using Kimball dimensional modeling: facts (measurable events) and dimensions (descriptive context).
+2. Classify each table as exactly ONE of: fact, dimension, bridge, aggregate.
+   - fact: Central event/transaction tables with measurable metrics (e.g. sales_fact)
+   - dimension: Descriptive context tables (e.g. dim_customer, dim_product, dim_date)
+   - bridge: Tables resolving M:N relationships between facts and dimensions
+   - aggregate: Pre-aggregated summary tables for performance
+3. ALWAYS include a dim_date dimension if any date/time columns exist in the schema.
+4. Column roles: pk (primary/surrogate key), measure (numeric additive/semi-additive metrics), attribute (descriptive).
+5. Use naming: fact_ prefix for facts, dim_ for dimensions, bridge_ for bridges, agg_ for aggregates.
+6. Do NOT include FK relationships — they will be determined globally later.
+7. Be CONCISE in descriptions (15 words max).
+8. Normalize data types to: STRING, LONG, DOUBLE, DATE, BOOLEAN, TIMESTAMP."""
+        json_tmpl = """{
+  "proposed_tables": [
+    {
+      "table_name": "entity_name",
+      "table_type": "fact|dimension|bridge|aggregate",
+      "description": "Short description",
+      "source_tables": ["original_table"],
+      "columns": [
+        {
+          "name": "col_name",
+          "data_type": "STRING|LONG|DOUBLE|DATE|BOOLEAN|TIMESTAMP",
+          "role": "pk|measure|attribute",
+          "source": "original_table.column or generated",
+          "description": "Short description"
+        }
+      ]
+    }
+  ],
+  "columns_dropped": [{"source_table": "t", "column": "c", "reason": "why"}],
+  "data_summary": "3-4 sentences summarizing the data domain and model rationale."
+}"""
+        intro = f"Analyze the following tables and propose a dimensional model (Kimball star schema)."
+    else:
+        rules = """RULES:
 1. Normalize to strict 3rd Normal Form. Eliminate all transitive dependencies.
 2. Classify each entity as exactly ONE of: core_entity, weak_entity, associative, reference.
    - core_entity: Independent entities with strong PKs (e.g. customers, products, orders)
@@ -710,42 +797,46 @@ RULES:
 3. Column roles must be ONLY: pk or attribute. Do NOT extract FK relationships in this step.
 4. Be CONCISE in descriptions (15 words max each).
 5. Normalize data types to: STRING, LONG, DOUBLE, DATE, BOOLEAN, TIMESTAMP.
-6. Do NOT include a "relationships" array — relationships will be determined globally in a later step.
-
-PROFILING DATA:
-{payload}
-
-Return ONLY valid JSON with this EXACT structure (use these EXACT key names):
-{{
+6. Do NOT include a "relationships" array — relationships will be determined globally in a later step."""
+        json_tmpl = """{
   "proposed_tables": [
-    {{
+    {
       "table_name": "entity_name",
       "table_type": "core_entity|weak_entity|associative|reference",
       "description": "Short description",
       "source_tables": ["original_table"],
       "columns": [
-        {{
+        {
           "name": "col_name",
           "data_type": "STRING|LONG|DOUBLE|DATE|BOOLEAN|TIMESTAMP",
           "role": "pk|attribute",
           "source": "original_table.column or generated",
           "description": "Short description"
-        }}
+        }
       ]
-    }}
+    }
   ],
-  "columns_dropped": [
-    {{
-      "source_table": "table",
-      "column": "col",
-      "reason": "why dropped"
-    }}
-  ],
-  "data_summary": "3-4 sentences summarizing the data domain and model rationale.",
-  "recommended_consumers": ["Analytics Team", "Finance"]
-}}
-"""
+  "columns_dropped": [{"source_table": "t", "column": "c", "reason": "why"}],
+  "data_summary": "3-4 sentences summarizing the data domain and model rationale."
+}"""
+        intro = "Analyze the following tables and propose normalized 3NF entity definitions."
 
+    return f"""{sys}
+
+You are analyzing a SUBSET of tables from `{catalog}`.`{schema}`.
+All tables in the schema: {all_names}
+
+{intro}
+Note cross-references to tables NOT in this subset — they will be merged later.
+
+{rules}
+
+PROFILING DATA:
+{payload}
+
+Return ONLY valid JSON with this EXACT structure (use these EXACT key names):
+{json_tmpl}
+"""
 
 def _build_merge_prompt(group_results, catalog, schema):
     """DEPRECATED: LLM-based merge is no longer used. Kept as stub for compatibility."""
@@ -782,9 +873,25 @@ def _build_schema_catalog(proposed_tables):
     return "\n".join(lines)
 
 
-def _build_reduce_prompt(compressed_catalog, catalog, schema):
+def _build_reduce_prompt(compressed_catalog, catalog, schema, model_type="3nf"):
     """Build the Reduce phase prompt for global relationship mapping."""
-    return f"""You are an Enterprise Data Architect specializing in relational integrity.
+    if model_type == "dimensional":
+        context = f"""You are an Enterprise Data Architect specializing in Kimball dimensional modeling.
+
+I am providing a complete dimensional model schema catalog for `{catalog}`.`{schema}`.
+Each table lists its columns and Primary Keys.
+
+Your ONLY task: identify EVERY foreign key relationship (fact→dimension joins, bridge links).
+
+RULES:
+1. Every fact table FK MUST reference a dimension PK (star schema joins).
+2. Bridge tables should have at least 2 FK relationships (one to fact/dim, one to dim).
+3. Do NOT invent columns — only use columns that exist in the catalog.
+4. Include cardinality (1:1, 1:N, M:N).
+5. Use action-verb descriptions (e.g., "Each sale references one product dimension").
+6. Ensure no cross-table relationship is missed."""
+    else:
+        context = f"""You are an Enterprise Data Architect specializing in relational integrity.
 
 I am providing a complete normalized 3NF schema catalog for `{catalog}`.`{schema}`.
 Each entity lists its columns and Primary Keys.
@@ -798,29 +905,32 @@ RULES:
 3. Include cardinality (1:1, 1:N, M:N).
 4. Use action-verb descriptions (e.g., "Each order belongs to one customer").
 5. Ensure no cross-entity relationship is missed.
-6. For associative (junction) tables, there should be at least 2 FK relationships.
+6. For associative (junction) tables, there should be at least 2 FK relationships."""
 
-SCHEMA CATALOG:
-{compressed_catalog}
-
-Return ONLY valid JSON:
-{{
+    json_tmpl = """{
   "relationships": [
-    {{
+    {
       "from_table": "child_entity",
       "from_column": "fk_column",
       "to_table": "parent_entity",
       "to_column": "pk_column",
       "cardinality": "1:N",
       "description_english": "Each X belongs to one Y"
-    }}
+    }
   ]
-}}
+}"""
+
+    return f"""{context}
+
+SCHEMA CATALOG:
+{compressed_catalog}
+
+Return ONLY valid JSON:
+{json_tmpl}
 
 Return ONLY the JSON. No markdown fences. No extra text."""
 
-
-def _map_global_relationships(proposed_tables, catalog, schema, token):
+def _map_global_relationships(proposed_tables, catalog, schema, token, model_type="3nf"):
     """Reduce phase: Use Opus to infer all FK→PK relationships globally.
 
     Takes the merged Map output (all proposed entities), compresses it
@@ -832,7 +942,7 @@ def _map_global_relationships(proposed_tables, catalog, schema, token):
     print(f"[REDUCE] Schema catalog: {len(catalog_text):,} chars for {len(proposed_tables)} entities", flush=True)
 
     # Build prompt
-    prompt = _build_reduce_prompt(catalog_text, catalog, schema)
+    prompt = _build_reduce_prompt(catalog_text, catalog, schema, model_type)
     print(f"[REDUCE] Prompt: {len(prompt):,} chars", flush=True)
 
     # Race all Opus endpoints
@@ -890,13 +1000,13 @@ def _parse_llm_json_relationships(raw):
 # LLM ANALYSIS PIPELINE
 # =============================================================================
 
-def _analyze_single_pass(payload, catalog, schema, token):
+def _analyze_single_pass(payload, catalog, schema, token, model_type="3nf"):
     """For small schemas: single Sonnet call with fallback chain. No racing = zero waste."""
     pools = _get_model_pools()
     model_chain = pools["map"]["primary"] + pools["map"]["fallback"]
     _short = lambda m: m.replace("databricks-claude-", "")
     ep_names = [_short(m) for m in model_chain]
-    prompt = _build_analysis_prompt(payload, catalog, schema)
+    prompt = _build_analysis_prompt(payload, catalog, schema, model_type)
     table_count = payload.count(chr(10) + "Table: ")
     print(f"[LLM] Direct call: {len(prompt):,} chars for {table_count} tables → {ep_names[0]} (fallback: {', '.join(ep_names[1:])})", flush=True)
     _add_step(f"⏳ Analyzing {table_count} tables via {ep_names[0]} (fallback: {', '.join(ep_names[1:])})")
@@ -923,7 +1033,7 @@ def _analyze_single_pass(payload, catalog, schema, token):
     return result
 
 
-def _analyze_groups(payload_per_table, catalog, schema, token, all_table_names, group_size=None):
+def _analyze_groups(payload_per_table, catalog, schema, token, all_table_names, group_size=None, model_type="3nf"):
     """Distribute table groups across Sonnet endpoints in parallel (Map phase).
 
     group_size: dynamic — calculated to maximize parallelism across endpoints.
@@ -977,7 +1087,7 @@ def _analyze_groups(payload_per_table, catalog, schema, token, all_table_names, 
         fallback = other_primary + map_fallback
         _g_t0 = time.time()
         group_payload = "\n".join(payload_per_table[t] for t in group_tables if t in payload_per_table)
-        prompt = _build_group_prompt(group_payload, catalog, schema, all_table_names)
+        prompt = _build_group_prompt(group_payload, catalog, schema, all_table_names, model_type)
         print(f"[GROUP] ▶ Group {endpoint_idx+1} started → {_short(ep)} | {len(group_tables)} tables | prompt={len(prompt):,} chars", flush=True)
 
         try:
@@ -989,7 +1099,7 @@ def _analyze_groups(payload_per_table, catalog, schema, token, all_table_names, 
             for tbl in group_tables:
                 if tbl not in payload_per_table:
                     continue
-                sub_prompt = _build_group_prompt(payload_per_table[tbl], catalog, schema, all_table_names)
+                sub_prompt = _build_group_prompt(payload_per_table[tbl], catalog, schema, all_table_names, model_type)
                 try:
                     sub_result = _call_chat_model(sub_prompt, token, MAX_TOKENS_GROUP, model_chain=[ep] + fallback)
                     sub_results.append(sub_result)
@@ -1000,7 +1110,7 @@ def _analyze_groups(payload_per_table, catalog, schema, token, all_table_names, 
             if sub_results:
                 merged_tables = []
                 for sr in sub_results:
-                    parsed = _parse_llm_json(sr)
+                    parsed = _parse_llm_json(sr, model_type)
                     if parsed:
                         merged_tables.extend(parsed.get("proposed_tables", []))
                 result = json.dumps({"proposed_tables": merged_tables, "relationships": [], "columns_dropped": []})
@@ -1024,7 +1134,7 @@ def _analyze_groups(payload_per_table, catalog, schema, token, all_table_names, 
             try:
                 result_text, gidx = future.result()
                 if result_text:
-                    parsed = _parse_llm_json(result_text)
+                    parsed = _parse_llm_json(result_text, model_type)
                     if parsed:
                         n_tables = len(parsed.get("proposed_tables", []))
                         group_results.append(parsed)
@@ -1065,7 +1175,6 @@ def _analyze_groups(payload_per_table, catalog, schema, token, all_table_names, 
     merged_rels = []     # all relationships (dedup later)
     merged_dropped = []
     merged_summaries = []
-    merged_consumers = set()
 
     for g in group_results:
         # Merge proposed tables (deduplicate by table_name, keep the one with more columns)
@@ -1087,9 +1196,6 @@ def _analyze_groups(payload_per_table, catalog, schema, token, all_table_names, 
         if s:
             merged_summaries.append(s)
 
-        # Collect consumers
-        for c in g.get("recommended_consumers", []):
-            merged_consumers.add(c)
 
     # Deduplicate relationships by (from_table, from_column, to_table, to_column)
     seen_rels = set()
@@ -1115,7 +1221,6 @@ def _analyze_groups(payload_per_table, catalog, schema, token, all_table_names, 
         "relationships": unique_rels,
         "columns_dropped": unique_dropped,
         "data_summary": " ".join(merged_summaries[:3]),  # Combine first 3 summaries
-        "recommended_consumers": sorted(merged_consumers),
     }
 
     merge_elapsed = time.time() - _merge_t0
@@ -1130,7 +1235,7 @@ def _analyze_groups(payload_per_table, catalog, schema, token, all_table_names, 
 # JSON PARSING & VALIDATION
 # =============================================================================
 
-def _parse_llm_json(raw):
+def _parse_llm_json(raw, model_type="3nf"):
     """Parse LLM response JSON with tolerance for markdown fences."""
     if not raw:
         return None
@@ -1165,24 +1270,39 @@ def _parse_llm_json(raw):
         return None
 
     # Normalize table types (3NF entity types)
-    valid_types = {"core_entity", "weak_entity", "associative", "reference"}
+    if model_type == "dimensional":
+        valid_types = {"fact", "dimension", "bridge", "aggregate"}
+    else:
+        valid_types = {"core_entity", "weak_entity", "associative", "reference"}
     for t in data.get("proposed_tables", []):
         tt = t.get("table_type", "").lower()
         if tt not in valid_types:
             name = t.get("table_name", "").lower()
-            if "assoc" in name or "bridge" in name or "link" in name or "junction" in name:
-                t["table_type"] = "associative"
-            elif "ref" in name or "lkp" in name or "lookup" in name or "code" in name:
-                t["table_type"] = "reference"
-            elif "_dep" in name or "detail" in name or "line" in name:
-                t["table_type"] = "weak_entity"
+            if model_type == "dimensional":
+                # Dimensional fallback
+                if "fact" in name or "fct" in name:
+                    t["table_type"] = "fact"
+                elif "bridge" in name or "link" in name or "junction" in name:
+                    t["table_type"] = "bridge"
+                elif "agg" in name or "summary" in name:
+                    t["table_type"] = "aggregate"
+                else:
+                    t["table_type"] = "dimension"
             else:
-                t["table_type"] = "core_entity"
+                # 3NF fallback
+                if "assoc" in name or "bridge" in name or "link" in name or "junction" in name:
+                    t["table_type"] = "associative"
+                elif "ref" in name or "lkp" in name or "lookup" in name or "code" in name:
+                    t["table_type"] = "reference"
+                elif "_dep" in name or "detail" in name or "line" in name:
+                    t["table_type"] = "weak_entity"
+                else:
+                    t["table_type"] = "core_entity"
         else:
             t["table_type"] = tt
 
         # Normalize column roles (3NF: no "measure" role)
-        valid_roles = {"pk", "fk", "attribute"}
+        valid_roles = {"pk", "fk", "measure", "attribute"} if model_type == "dimensional" else {"pk", "fk", "attribute"}
         for c in t.get("columns", []):
             role = c.get("role", "").lower()
             if role not in valid_roles:
@@ -1194,7 +1314,6 @@ def _parse_llm_json(raw):
     data.setdefault("relationships", [])
     data.setdefault("columns_dropped", [])
     data.setdefault("data_summary", "")
-    data.setdefault("recommended_consumers", [])
 
     return data
 
@@ -1240,7 +1359,7 @@ def _check_cancelled():
 # BACKGROUND GENERATION THREAD
 # =============================================================================
 
-def _bg_generate(catalog, schema, layout, token):
+def _bg_generate(catalog, schema, model_type, token):
     """Background thread: profile schema, call LLM, parse result."""
     _tls.token = token
     try:
@@ -1276,17 +1395,17 @@ def _bg_generate(catalog, schema, layout, token):
             # Edge case: only 1 table — direct call, no distribution needed
             single_payload = list(per_table.values())[0]
             _add_step(f"🧠 Analyzing 1 table via {ep_names[0]} (Sonnet Map)")
-            raw_response = _analyze_single_pass(single_payload, prof_catalog, prof_schema, token)
+            raw_response = _analyze_single_pass(single_payload, prof_catalog, prof_schema, token, model_type)
         else:
             # Groups of LLM_GROUP_SIZE tables, round-robin across Sonnet endpoints
             _add_step(f"⚡ {table_count} tables in groups of {LLM_GROUP_SIZE} → Sonnet round-robin {', '.join(ep_names)}")
-            raw_response = _analyze_groups(per_table, prof_catalog, prof_schema, token, list(per_table.keys()))
+            raw_response = _analyze_groups(per_table, prof_catalog, prof_schema, token, list(per_table.keys()), model_type=model_type)
 
         _check_cancelled()
 
         # Step 3: Parse Map output
         _add_step(f"🔍 Parsing Map response ({len(raw_response):,} chars) — extracting entities...")
-        model = _parse_llm_json(raw_response)
+        model = _parse_llm_json(raw_response, model_type)
         if not model:
             _job["error"] = "Failed to parse LLM response as valid JSON"
             _add_step("❌ Parse failed — LLM returned invalid JSON", status="error")
@@ -1303,7 +1422,7 @@ def _bg_generate(catalog, schema, layout, token):
             _add_step(f"🧠 Reduce phase — racing Opus endpoints for global FK→PK mapping...")
             try:
                 relationships = _map_global_relationships(
-                    model.get("proposed_tables", []), catalog, schema, token
+                    model.get("proposed_tables", []), catalog, schema, token, model_type
                 )
                 model["relationships"] = relationships
 
@@ -1406,6 +1525,168 @@ def build_proposed_erd_elements(model):
 
 
 def get_cytoscape_stylesheet():
+    """Professional ERD stylesheet — clean, business-friendly, presentation-ready."""
+    return [
+        # --- Default Node: Clean card-style entity box ---
+        {
+            "selector": "node",
+            "style": {
+                "label": "data(label)",
+                "text-wrap": "wrap",
+                "text-valign": "center",
+                "text-halign": "center",
+                "font-size": "12px",
+                "font-family": "'Inter', 'Segoe UI', -apple-system, sans-serif",
+                "font-weight": "600",
+                "color": "#ffffff",
+                "background-color": "data(color)",
+                "shape": "round-rectangle",
+                "width": 220,
+                "height": 60,
+                "border-width": 2.5,
+                "border-color": "#cbd5e1",
+                "border-opacity": 1,
+                "text-max-width": 200,
+                "padding": "8px",
+                # Shadow effect via overlay
+                "overlay-opacity": 0,
+                "shadow-blur": 12,
+                "shadow-color": "#00000020",
+                "shadow-offset-x": 0,
+                "shadow-offset-y": 4,
+                "shadow-opacity": 0.3,
+            },
+        },
+        # --- 3NF Entity types ---
+        {"selector": ".core_entity", "style": {"background-color": COLORS["core_entity"], "border-color": "#1e40af", "border-width": 3}},
+        {"selector": ".weak_entity", "style": {"background-color": COLORS["weak_entity"], "border-color": "#0284c7", "border-style": "dashed", "border-width": 2.5}},
+        {"selector": ".associative", "style": {"background-color": COLORS["associative"], "border-color": "#ea580c", "border-width": 2.5}},
+        {"selector": ".reference", "style": {"background-color": COLORS["reference"], "border-color": "#475569", "border-width": 2, "border-style": "dotted"}},
+        # --- Dimensional Entity types ---
+        {"selector": ".fact", "style": {"background-color": COLORS["fact"], "border-color": "#1d4ed8", "border-width": 3.5}},
+        {"selector": ".dimension", "style": {"background-color": COLORS["dimension"], "border-color": "#15803d", "border-width": 2.5}},
+        {"selector": ".bridge", "style": {"background-color": COLORS["bridge"], "border-color": "#c2410c", "border-width": 2.5, "border-style": "dashed"}},
+        {"selector": ".aggregate", "style": {"background-color": COLORS["aggregate"], "border-color": "#6d28d9", "border-width": 2.5, "border-style": "dotted"}},
+        # --- Edges: Professional relationship lines ---
+        {
+            "selector": "edge",
+            "style": {
+                "label": "data(label)",
+                "curve-style": "bezier",
+                "target-arrow-shape": "triangle",
+                "target-arrow-color": "#64748b",
+                "target-arrow-fill": "filled",
+                "arrow-scale": 1.2,
+                "line-color": "#94a3b8",
+                "line-style": "solid",
+                "width": 2,
+                "font-size": "10px",
+                "font-family": "'Inter', 'Segoe UI', sans-serif",
+                "font-weight": "600",
+                "color": "#475569",
+                "text-rotation": "autorotate",
+                "text-margin-y": -12,
+                "text-background-color": "#f8fafc",
+                "text-background-opacity": 0.9,
+                "text-background-padding": "3px",
+                "text-background-shape": "roundrectangle",
+            },
+        },
+        # --- Hover: subtle highlight ---
+        {
+            "selector": "node:active",
+            "style": {
+                "overlay-color": "#facc15",
+                "overlay-opacity": 0.15,
+            },
+        },
+        # --- Selected: gold highlight ---
+        {
+            "selector": "node:selected",
+            "style": {
+                "border-width": 4,
+                "border-color": "#facc15",
+                "shadow-blur": 20,
+                "shadow-color": "#facc1540",
+                "shadow-opacity": 0.6,
+            },
+        },
+        # --- Connected edges highlight on node select ---
+        {
+            "selector": "edge:selected",
+            "style": {
+                "line-color": "#2563eb",
+                "target-arrow-color": "#2563eb",
+                "width": 3,
+            },
+        },
+        # --- Dimmed (for search filter) ---
+        {
+            "selector": ".dimmed",
+            "style": {
+                "opacity": 0.15,
+            },
+        },
+    ]
+
+def build_proposed_erd_elements(model):
+    """Build Cytoscape elements from LLM model proposal."""
+    elements = []
+    if not model:
+        return elements
+
+    # Nodes — one per proposed table
+    for t in model.get("proposed_tables", []):
+        tname = t.get("table_name", "unknown")
+        ttype = t.get("table_type", "core_entity").lower()
+        col_count = len(t.get("columns", []))
+        color = COLORS.get(ttype, COLORS["attribute"])
+
+        elements.append({
+            "data": {
+                "id": tname,
+                "label": f"{tname}\n({col_count} cols)",
+                "table_type": ttype,
+                "color": color,
+                "description": t.get("description", ""),
+                "columns": json.dumps(t.get("columns", [])),
+                "source_tables": json.dumps(t.get("source_tables", [])),
+            },
+            "classes": ttype,
+        })
+
+    # Edges — consolidated: ONE per table pair
+    edge_map = defaultdict(list)  # (from_table, to_table) -> [relationships]
+    for r in model.get("relationships", []):
+        ft = r.get("from_table", "")
+        tt = r.get("to_table", "")
+        if ft and tt:
+            key = tuple(sorted([ft, tt]))
+            edge_map[key].append(r)
+
+    for (t1, t2), rels in edge_map.items():
+        # Use first relationship's direction
+        first = rels[0]
+        label = first.get("cardinality", "")
+        if len(rels) > 1:
+            label += f" ({len(rels)} rels)"
+
+        elements.append({
+            "data": {
+                "id": f"edge_{first.get('from_table', 'x')}_{first.get('to_table', 'y')}",
+                "source": first.get("from_table", ""),
+                "target": first.get("to_table", ""),
+                "label": label,
+                "description": first.get("description_english", ""),
+                "rel_count": len(rels),
+                "all_rels": json.dumps(rels),
+            }
+        })
+
+    return elements
+
+
+def get_cytoscape_stylesheet():
     """Get the Cytoscape stylesheet for the ERD graph."""
     return [
         # Default node
@@ -1432,6 +1713,11 @@ def get_cytoscape_stylesheet():
         {"selector": ".weak_entity", "style": {"background-color": COLORS["weak_entity"], "border-color": "#0284c7"}},
         {"selector": ".associative", "style": {"background-color": COLORS["associative"], "border-color": "#ea580c"}},
         {"selector": ".reference", "style": {"background-color": COLORS["reference"], "border-color": "#475569"}},
+        # Dimensional Entity types
+        {"selector": ".fact", "style": {"background-color": COLORS["fact"], "border-color": "#1d4ed8"}},
+        {"selector": ".dimension", "style": {"background-color": COLORS["dimension"], "border-color": "#15803d"}},
+        {"selector": ".bridge", "style": {"background-color": COLORS["bridge"], "border-color": "#c2410c"}},
+        {"selector": ".aggregate", "style": {"background-color": COLORS["aggregate"], "border-color": "#6d28d9"}},
         # Edges
         {
             "selector": "edge",
@@ -1471,6 +1757,7 @@ def get_cytoscape_stylesheet():
 # =============================================================================
 
 def build_summary_panel(model):
+    mt = model.get("_model_type", "3nf")
     """Build full-width summary section below ERD with card layout."""
     if not model:
         return html.Div("No model generated yet.", style={"color": "#94a3b8", "padding": "20px"})
@@ -1487,24 +1774,7 @@ def build_summary_panel(model):
             ], className="summary-card")
         )
 
-    # --- Recommended Consumers card ---
-    consumers = model.get("recommended_consumers", [])
-    if consumers:
-        badge_colors = ["#2563eb", "#16a34a", "#dc2626", "#ea580c", "#7c3aed", "#0891b2", "#be185d", "#ca8a04"]
-        badges = []
-        for i, c in enumerate(consumers):
-            bg = badge_colors[i % len(badge_colors)]
-            badges.append(html.Span(c, style={
-                "display": "inline-block", "padding": "6px 16px", "borderRadius": "20px",
-                "background": bg, "color": "white", "fontSize": "13px", "fontWeight": "500",
-                "margin": "4px",
-            }))
-        sections.append(
-            html.Div([
-                html.H3(["\U0001f465 Recommended Consumers"], className="card-title"),
-                html.Div(badges, style={"display": "flex", "flexWrap": "wrap", "gap": "4px"}),
-            ], className="summary-card")
-        )
+
 
     # --- Proposed Tables card (HTML table) ---
     tables = model.get("proposed_tables", [])
@@ -1520,18 +1790,19 @@ def build_summary_panel(model):
 
         rows = []
         for t in tables:
-            ttype = t.get("table_type", "core_entity")
+            ttype = t.get("table_type", "fact" if mt == "dimensional" else "core_entity")
             cols = t.get("columns", [])
             pks = sum(1 for c in cols if c.get("role", "").lower() == "pk")
             fks = sum(1 for c in cols if c.get("role", "").lower() == "fk")
             attrs = sum(1 for c in cols if c.get("role", "").lower() == "attribute")
+            measures = sum(1 for c in cols if c.get("role", "").lower() == "measure")
             sources = ", ".join(t.get("source_tables", []))
             rows.append(html.Tr([
                 html.Td(html.Span(ttype.upper(), className=f"badge badge-{ttype}")),
                 html.Td(t.get("table_name", "?"), style={"fontWeight": "600"}),
                 html.Td(t.get("description", ""), style={"color": "#475569", "fontSize": "13px"}),
                 html.Td(str(len(cols)), style={"textAlign": "center", "fontWeight": "600", "color": "#2563eb"}),
-                html.Td(f"{pks}PK / {fks}FK / {attrs}A", style={"fontSize": "12px", "color": "#64748b"}),
+                html.Td(f"{pks}PK / {fks}FK / {measures}M / {attrs}A" if mt == "dimensional" else f"{pks}PK / {fks}FK / {attrs}A", style={"fontSize": "12px", "color": "#64748b"}),
                 html.Td(sources, style={"fontSize": "12px", "color": "#64748b"}),
             ]))
 
@@ -1666,17 +1937,24 @@ def _generate_consulting_report(model):
     rels = m.get("relationships", [])
     dropped = m.get("columns_dropped", [])
     summary_text = m.get("data_summary", "")
-    consumers = m.get("recommended_consumers", [])
     catalog = m.get("_catalog", "")
     schema = m.get("_schema", "")
+    mt = m.get("_model_type", "3nf")
     total_cols = sum(len(t.get("columns", [])) for t in tables)
-    type_order = {"core_entity": 0, "weak_entity": 1, "associative": 2, "reference": 3}
+
+    if mt == "dimensional":
+        type_order = {"fact": 0, "dimension": 1, "bridge": 2, "aggregate": 3}
+        CLR = {"fact": (37, 99, 235), "dimension": (22, 163, 74), "bridge": (234, 88, 12), "aggregate": (124, 58, 237)}
+    else:
+        type_order = {"core_entity": 0, "weak_entity": 1, "associative": 2, "reference": 3}
+        CLR = {"core_entity": (30, 58, 138), "weak_entity": (14, 165, 233), "associative": (249, 115, 22), "reference": (100, 116, 139)}
+
     tables_sorted = sorted(tables, key=lambda t: type_order.get(t.get("table_type", "").lower(), 9))
     type_counts = {}
+    default_type = "fact" if mt == "dimensional" else "core_entity"
     for t in tables:
-        tt = t.get("table_type", "core_entity").lower()
+        tt = t.get("table_type", default_type).lower()
         type_counts[tt] = type_counts.get(tt, 0) + 1
-    CLR = {"core_entity": (30, 58, 138), "weak_entity": (14, 165, 233), "associative": (249, 115, 22), "reference": (100, 116, 139)}
 
     # --- McKinsey-style table helper ---
     def draw_table(headers, rows, col_widths, start_y=None, accent=BLUE):
@@ -1795,7 +2073,7 @@ def _generate_consulting_report(model):
     pdf.set_xy(M, 62)
     pdf.set_font("Helvetica", "", 12)
     pdf.set_text_color(*LGRAY)
-    pdf.cell(W, 6, "RELATIONAL DATA MODEL (3NF)")
+    pdf.cell(W, 6, "DIMENSIONAL DATA MODEL" if mt == "dimensional" else "RELATIONAL DATA MODEL (3NF)")
     pdf.ln(8)
     pdf.set_font("Helvetica", "B", 32)
     pdf.set_text_color(*WHITE)
@@ -1834,17 +2112,7 @@ def _generate_consulting_report(model):
     pdf.add_page()
     section_title("01", "Executive Summary")
     body_text(summary_text or "No data summary available.", 9)
-    if consumers:
-        pdf.ln(2)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.set_text_color(*NAVY)
-        pdf.cell(W, 5, "Recommended Data Consumers", new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(2)
-        for c in consumers:
-            pdf.set_font("Helvetica", "", 8)
-            pdf.set_text_color(*DGRAY)
-            pdf.cell(W, 4.5, f"    {c}", new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(4)
+
 
     # Type distribution
     if type_counts:
@@ -1974,7 +2242,6 @@ def _generate_consulting_report(model):
     label_value("Relationships:", str(len(rels)))
     label_value("Dropped Columns:", str(len(dropped)))
     label_value("Table Types:", ", ".join(f"{k}: {v}" for k, v in sorted(type_counts.items())))
-    label_value("Consumers:", ", ".join(consumers) if consumers else "N/A")
     pdf.ln(10)
     body_text("This report was auto-generated by the AI Data Model Designer. "
               "All specifications should be reviewed by a data architect before implementation.", 8)
@@ -2157,19 +2424,19 @@ app.layout = html.Div(
                                  className="dash-dropdown", style={"width": "400px"}),
                 ], className="control-group"),
                 html.Div([
-                    html.Label("LAYOUT", className="control-label"),
-                    dcc.Dropdown(
-                        id="layout-dd",
+                    html.Label("MODEL TYPE", className="control-label"),
+                    dcc.RadioItems(
+                        id="model-type-radio",
                         options=[
-                            {"label": "Cola", "value": "cola"},
-                            {"label": "Dagre", "value": "dagre"},
-                            {"label": "Breadthfirst", "value": "breadthfirst"},
-                            {"label": "Circle", "value": "circle"},
-                            {"label": "Grid", "value": "grid"},
-                            {"label": "Concentric", "value": "concentric"},
+                            {"label": " 3NF Relational", "value": "3nf"},
+                            {"label": " Dimensional (Star)", "value": "dimensional"},
                         ],
-                        value="cola",
-                        className="dash-dropdown", style={"width": "130px"},
+                        value="3nf",
+                        inline=True,
+                        className="model-type-radio",
+                        inputStyle={"marginRight": "4px"},
+                        labelStyle={"marginRight": "16px", "fontSize": "13px", "fontWeight": "500",
+                                     "color": "#334155", "cursor": "pointer"},
                     ),
                 ], className="control-group"),
                 html.Div(style={"flex": "1"}),
@@ -2192,8 +2459,10 @@ app.layout = html.Div(
                             id="erd-graph",
                             elements=[],
                             stylesheet=get_cytoscape_stylesheet(),
-                            layout={"name": "cola", "animate": False, "nodeSpacing": 80,
-                                    "edgeLengthVal": 150, "maxSimulationTime": 2000},
+                            layout={"name": "cola", "animate": False, "randomize": True,
+                                    "nodeSpacing": 100, "edgeLengthVal": 200,
+                                    "maxSimulationTime": 4000, "convergenceThreshold": 0.001,
+                                    "fit": True, "padding": 50},
                             style={"width": "100%", "height": "calc(100vh - 160px)",
                                    "backgroundColor": "#f8fafc"},
                         ),
@@ -2232,18 +2501,23 @@ app.layout = html.Div(
             style={"display": "flex", "width": "100%"},
         ),
 
-        # Legend bar
+        # Legend bar — dynamic based on model type
         html.Div(
             [
-                html.Span("\u25cf", style={"color": COLORS["core_entity"], "marginRight": "4px"}),
-                html.Span("Core Entity", style={"marginRight": "16px"}),
-                html.Span("\u25cf", style={"color": COLORS["weak_entity"], "marginRight": "4px"}),
-                html.Span("Weak Entity", style={"marginRight": "16px"}),
-                html.Span("\u25cf", style={"color": COLORS["associative"], "marginRight": "4px"}),
-                html.Span("Associative", style={"marginRight": "16px"}),
-                html.Span("\u25cf", style={"color": COLORS["reference"], "marginRight": "4px"}),
-                html.Span("Reference", style={"marginRight": "16px"}),
-                html.Div(style={"flex": "1"}),
+                html.Div(
+                    id="legend-bar",
+                    children=[
+                        html.Span("\u25cf", style={"color": COLORS["core_entity"], "marginRight": "4px"}),
+                        html.Span("Core Entity", style={"marginRight": "16px"}),
+                        html.Span("\u25cf", style={"color": COLORS["weak_entity"], "marginRight": "4px"}),
+                        html.Span("Weak Entity", style={"marginRight": "16px"}),
+                        html.Span("\u25cf", style={"color": COLORS["associative"], "marginRight": "4px"}),
+                        html.Span("Associative", style={"marginRight": "16px"}),
+                        html.Span("\u25cf", style={"color": COLORS["reference"], "marginRight": "4px"}),
+                        html.Span("Reference", style={"marginRight": "16px"}),
+                    ],
+                    style={"display": "flex", "alignItems": "center", "flex": "1"},
+                ),
                 html.Button("Export Report", id="export-btn", className="export-btn", disabled=True),
             ],
             className="legend-bar",
@@ -2373,10 +2647,10 @@ def load_schemas(catalog):
     Input("generate-btn", "n_clicks"),
     State("catalog-dd", "value"),
     State("schema-dd", "value"),
-    State("layout-dd", "value"),
+    State("model-type-radio", "value"),
     prevent_initial_call=True,
 )
-def on_generate(n_clicks, catalog, schema, layout):
+def on_generate(n_clicks, catalog, schema, model_type):
     if not catalog or not schema:
         return {"display": "none"}, True
 
@@ -2385,9 +2659,10 @@ def on_generate(n_clicks, catalog, schema, layout):
 
     _job["_catalog"] = catalog
     _job["_schema"] = schema
+    _job["_model_type"] = model_type or "3nf"
     thread = threading.Thread(
         target=_bg_generate,
-        args=(catalog, schema, layout, token),
+        args=(catalog, schema, model_type or "3nf", token),
         daemon=True,
     )
     thread.start()
@@ -2411,6 +2686,7 @@ def on_cancel(n_clicks):
     Output("thinking-steps", "children"),
     Output("elapsed-timer", "children"),
     Output("erd-graph", "elements"),
+    Output("erd-graph", "layout"),
     Output("summary-panel", "children"),
     Output("model-store", "data"),
     Output("export-btn", "disabled"),
@@ -2449,36 +2725,22 @@ def poll_progress(n):
             # Add catalog/schema context for PDF report
             model["_catalog"] = _job.get("_catalog", "")
             model["_schema"] = _job.get("_schema", "")
+            model["_model_type"] = _job.get("_model_type", "3nf")
             elements = build_proposed_erd_elements(model)
             summary = build_summary_panel(model)
-            return step_items, elapsed, elements, summary, model, False, {"display": "none"}, True
+            _cola = {"name": "cola", "animate": False, "randomize": True, "nodeSpacing": 100, "edgeLengthVal": 200, "maxSimulationTime": 4000, "convergenceThreshold": 0.001, "fit": True, "padding": 50}
+            return step_items, elapsed, elements, _cola, summary, model, False, {"display": "none"}, True
         elif _job.get("error"):
             err_msg = _job["error"]
             error_panel = html.Div(
                 [html.H4("Error"), html.P(err_msg, style={"color": "#dc2626"})],
                 className="summary-card",
             )
-            return step_items, elapsed, [], error_panel, None, True, {"display": "none"}, True
+            return step_items, elapsed, [], no_update, error_panel, None, True, {"display": "none"}, True
 
     # Still in progress
-    return step_items, elapsed, no_update, no_update, no_update, no_update, no_update, no_update
+    return step_items, elapsed, no_update, no_update, no_update, no_update, no_update, no_update, no_update
 
-
-# --- Layout switcher ---
-@app.callback(
-    Output("erd-graph", "layout"),
-    Input("layout-dd", "value"),
-)
-def on_layout_change(layout_name):
-    layout_config = {"name": layout_name or "cola"}
-    if layout_name == "cola":
-        layout_config.update({"animate": False, "nodeSpacing": 80, "edgeLengthVal": 150,
-                              "maxSimulationTime": 2000})
-    elif layout_name == "dagre":
-        layout_config.update({"animate": False, "rankDir": "TB", "nodeSep": 60, "rankSep": 80})
-    else:
-        layout_config.update({"animate": False})
-    return layout_config
 
 
 # --- Search filter ---
@@ -2490,6 +2752,33 @@ def on_search(query):
     base = get_cytoscape_stylesheet()
     if not query or not query.strip():
         return base
+
+# --- Legend updater (model type aware) ---
+@app.callback(
+    Output("legend-bar", "children"),
+    Input("model-store", "data"),
+    prevent_initial_call=True,
+)
+def update_legend(model):
+    mt = (model or {}).get("_model_type", "3nf") if model else "3nf"
+    dot = lambda c: html.Span("\u25cf", style={"color": c, "marginRight": "4px"})
+    lbl = lambda t: html.Span(t, style={"marginRight": "16px"})
+    if mt == "dimensional":
+        items = [
+            dot(COLORS["fact"]), lbl("Fact"),
+            dot(COLORS["dimension"]), lbl("Dimension"),
+            dot(COLORS["bridge"]), lbl("Bridge"),
+            dot(COLORS["aggregate"]), lbl("Aggregate"),
+        ]
+    else:
+        items = [
+            dot(COLORS["core_entity"]), lbl("Core Entity"),
+            dot(COLORS["weak_entity"]), lbl("Weak Entity"),
+            dot(COLORS["associative"]), lbl("Associative"),
+            dot(COLORS["reference"]), lbl("Reference"),
+        ]
+    return items
+
 
     q = query.strip().lower()
     # Add dimmed class to non-matching nodes

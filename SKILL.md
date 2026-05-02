@@ -1,9 +1,9 @@
-# Intelligent ERD App — Complete Build Guide
+# AI Data Model Designer — Complete Build Guide
 
 > **Purpose**: Complete blueprint to rebuild the AI Data Model Designer app from scratch in any Databricks workspace.
 >
-> **Last Updated**: 2026-04-27
-> **Owner**: maintainer@your-org.com
+> **Last Updated**: 2026-05-02
+> **Owner**: sunny.singh@databricks.com
 
 ---
 
@@ -12,9 +12,9 @@
 **What it is**: A Databricks App (Dash/Cytoscape) called **"AI Data Model Designer"** that:
 1. Reads live metadata from Unity Catalog (tables, columns, PKs, FKs)
 2. Profiles schema data via TABLESAMPLE (10 rows per table)
-3. Sends profiling data to Claude Opus LLM (3 endpoints racing simultaneously)
-4. Receives an optimized star/snowflake dimensional model
-5. Renders it as a color-coded interactive ERD graph
+3. Uses a **Map-Reduce LLM pattern**: Sonnet for parallel entity extraction (Map), Opus for global relationship inference (Reduce)
+4. Supports **dual model types**: 3NF Relational or Dimensional (Kimball Star Schema)
+5. Renders a color-coded interactive ERD graph with professional styling
 6. Exports a consulting-grade multi-page PDF report
 
 **App Name**: `ai-data-model-designer`
@@ -26,20 +26,18 @@
 ## 2. File Structure
 
 ```
-/Workspace/Users/<user>/ai-data-model-designer/
+/Workspace/Users/<user>/ai-data-model-designer-git/
 ├── INSTALL.ipynb               # One-click installer notebook
 ├── README.md                   # Project documentation
 ├── SKILL.md                    # This file
 ├── app/                        # Databricks App (deployed from here)
-│   ├── app.py                  # Main Dash application (~2,400 lines, ~97KB)
+│   ├── app.py                  # Main Dash application (~2,970 lines, ~123KB, 60 functions)
 │   ├── app.yaml                # Databricks App config
-│   ├── requirements.txt        # Python dependencies (dash, dash-cytoscape, databricks-sdk, pandas, pyyaml, fpdf2)
-│   ├── assets/
-│   │   ├── style.css           # Custom CSS (pulse animation for thinking modal)
-│   │   ├── logo.png            # Company logo (used in UI header + PDF)
-│   │   └── logo_data.js        # Base64-encoded logo for PDF export
-│   └── scripts/
-│       └── generate_logo_b64.py
+│   ├── requirements.txt        # Python dependencies (dash, dash-cytoscape, databricks-sdk, pandas, fpdf2)
+│   └── assets/
+│       ├── style.css           # Custom CSS (~7.4KB: badges for 8 entity types, radio buttons, legend)
+│       ├── logo.png            # Company logo (UI header + PDF)
+│       └── logo_data.js        # Base64-encoded logo for PDF export
 ```
 
 ### app.yaml
@@ -74,53 +72,114 @@ pandas>=1.5.0
 | Scope | Purpose |
 |---|---|
 | `sql` | Execute SQL on warehouse |
-| `serving.serving-endpoints` | Foundation Model API (**NOTE**: NOT `serving-endpoints`) |
+| `serving.serving-endpoints` | Foundation Model API |
 | `catalog.catalogs:read` | List catalogs in dropdown |
 | `catalog.schemas:read` | List schemas in dropdown |
 | `catalog.tables:read` | Read information_schema |
 
 ---
 
-## 4. Architecture — Complete Data Flow
+## 4. Architecture — Map-Reduce LLM Pattern
 
 ```
-User selects Catalog + Schema → clicks "🤖 Generate Data Model"
+User selects Catalog + Schema + Model Type (3NF / Dimensional) → clicks Generate
   │
   ├─ Captures OAuth token from Flask request headers
-  ├─ Starts daemon thread: _bg_generate(catalog, schema, layout, token)
+  ├─ Starts daemon thread: _bg_generate(catalog, schema, model_type, token)
   ├─ Shows real-time thinking modal (dcc.Interval polls every 1.2s)
   │
-  ├─ Step 1: METADATA (parent thread)
+  ├─ Step 1: METADATA
   │   └─ SQL: information_schema.columns → table/column list
   │
   ├─ Step 2: PROFILING (ThreadPoolExecutor, 20 workers)
   │   └─ Per table: ONE query with TABLESAMPLE (10 ROWS)
   │       ├─ COUNT(*), COUNT(DISTINCT col), NULL counts
-  │       ├─ MIN/MAX for date/timestamp columns only
-  │       ├─ 3 sample values for top 4 string columns
-  │       └─ Row count: DESCRIBE DETAIL (Delta) or estimate (views)
-  │   └─ Token passed EXPLICITLY to each worker (not threading.local)
+  │       ├─ MIN/MAX for date/timestamp columns
+  │       └─ 3 sample values for top 4 string columns
   │
-  ├─ Step 3: LLM ANALYSIS (ALWAYS DISTRIBUTE)
-  │   ├─ group_size = 1 always (1 table per API call)
-  │   ├─ Opus-only: opus-4-7 (primary) + opus-4-6 (fallback)
-  │   ├─ Round-robin distribution across 2 Opus endpoints
-  │   ├─ Fallback chain: opus-4-7 → opus-4-6 per call
-  │   └─ PROGRAMMATIC MERGE: Python concatenate + deduplicate (<1s, no LLM merge)
+  ├─ Step 3: MAP PHASE (Sonnet, parallel)
+  │   ├─ _build_per_table_payloads(): individual payloads from profiles (NO truncation)
+  │   ├─ Groups of 3 tables (LLM_GROUP_SIZE=3)
+  │   ├─ 20 workers, round-robin across latest Sonnet endpoint(s)
+  │   ├─ On 400 BAD_REQUEST (oversized): auto-split into individual table calls
+  │   └─ Programmatic merge: Python dedup by table_name (<1ms)
   │
-  ├─ Step 4: VALIDATION
-  │   └─ parse_llm_model(): FK/PK integrity, orphan detection, type normalization
+  ├─ Step 4: REDUCE PHASE (Opus, racing)
+  │   ├─ _build_schema_catalog(): compressed structure-only catalog (~400 chars/table)
+  │   ├─ _build_reduce_prompt(): focused FK→PK inference prompt
+  │   ├─ _call_chat_model_race(): 3 Opus endpoints racing
+  │   └─ Validates: drops relationships to non-existent tables/columns
+  │   └─ Injects FK roles into columns
   │
-  ├─ Step 5: RENDER
-  │   └─ build_proposed_erd_elements() → Cytoscape nodes + edges
-  │       └─ Consolidated edges: ONE arrow per table pair
+  ├─ Step 5: PARSE & VALIDATE
+  │   └─ _parse_llm_json(raw, model_type): type/role normalization, fallback logic
   │
-  └─ Poll callback picks up result → renders graph + summary panel
+  └─ Step 6: RENDER
+      ├─ build_proposed_erd_elements() → Cytoscape nodes + edges
+      ├─ Cola layout with randomize=true, fit=true
+      └─ Dynamic legend updates based on model_type
 ```
+
+### Tiered Model Pools (_get_model_pools)
+
+| Phase | Primary | Fallback | Rationale |
+|---|---|---|---|
+| **Map** | Latest Sonnet only (version-filtered) | Older Sonnet → Opus → Haiku | Fast, cheap structured extraction |
+| **Reduce** | Top 3 Opus (racing) | Sonnet → Haiku | High-stakes cross-entity reasoning |
+
+### Endpoint Discovery & Version Sorting
+
+`_discover_endpoints()` queries all serving endpoints, filters for `claude` in name, and sorts by:
+1. **Tier**: Opus (0) → Sonnet (1) → Haiku (2)
+2. **Version** (descending): Versions are **padded to 3 digits** for correct comparison — e.g. `sonnet-4-6` → `(-4, -6, 0)` sorts before `sonnet-4` → `(-4, 0, 0)`, ensuring the latest sub-version is always selected.
+
+**CRITICAL**: Without padding, Python tuple comparison treats `(-4,)` as less than `(-4, -6)`, making `sonnet-4` (old) sort before `sonnet-4-6` (latest). The 3-digit padding fixes this.
+
+`_get_model_pools()` then filters the Sonnet list to only the **single latest version** (e.g., `sonnet-4-6`). Older Sonnet versions are pushed to the fallback chain.
+
+Auto-refreshes every 5 minutes.
+
+### Throughput (200 tables)
+| Config | Map Time | Reduce Time | Total |
+|---|---|---|---|
+| Old (all Opus, group_size=1) | \~11 min | N/A | \~11 min |
+| New (Sonnet Map + Opus Reduce) | \~1.5 min | \~45s | **\~2.5 min** |
 
 ---
 
-## 5. Authentication Pattern
+## 5. Dual Model Types
+
+### Model Type Selection
+- **UI**: `dcc.RadioItems(id="model-type-radio")` with options: `3nf` (default), `dimensional`
+- **Flow**: `on_generate` → `_bg_generate(model_type)` → prompts/parser/colors all parameterized
+
+### 3NF Relational Mode
+- Entity types: `core_entity`, `weak_entity`, `associative`, `reference`
+- Column roles (Map): `pk`, `attribute` (FKs deferred to Reduce)
+- Prompts: "Normalize to strict 3NF. Eliminate transitive dependencies."
+- Reduce: FK→PK inference for relational integrity
+
+### Dimensional (Kimball) Mode
+- Entity types: `fact`, `dimension`, `bridge`, `aggregate`
+- Column roles (Map): `pk`, `measure`, `attribute` (FKs deferred to Reduce)
+- Prompts: "Design using Kimball methodology. Always include dim_date."
+- Naming convention: `fact_`, `dim_`, `bridge_`, `agg_` prefixes
+- Reduce: Fact→Dimension joins, bridge links
+
+### Parameterized Functions
+| Function | model_type behavior |
+|---|---|
+| `_build_system_prompt(mt)` | "3NF specialist" vs "Kimball methodology expert" |
+| `_build_analysis_prompt(mt)` | Different rules, entity types, role options, JSON schema |
+| `_build_group_prompt(mt)` | Same as analysis, for groups of 3 tables |
+| `_build_reduce_prompt(mt)` | "relational integrity" vs "star schema joins" |
+| `_parse_llm_json(raw, mt)` | Valid types/roles differ; fallback logic differs |
+| `build_summary_panel(model)` | Shows Measures count for dimensional |
+| PDF `_generate_consulting_report(m)` | Title, colors, type_order, role_labels all conditional |
+
+---
+
+## 6. Authentication Pattern
 
 ### Token Flow (CRITICAL for background threads)
 ```python
@@ -128,70 +187,65 @@ User selects Catalog + Schema → clicks "🤖 Generate Data Model"
 token = flask_request.headers.get("x-forwarded-access-token")
 
 # Passed to background thread:
-threading.Thread(target=_bg_generate, args=(catalog, schema, layout, token))
+threading.Thread(target=_bg_generate, args=(catalog, schema, model_type, token))
 
 # Background thread sets thread-local:
-_tls = threading.local()
 _tls.token = token
 
-# Profile workers receive token EXPLICITLY (threading.local doesn't inherit):
+# Profile workers receive token EXPLICITLY:
 def _profile_single_table(catalog, schema, tname, cols, token=None):
-    _tls.token = token  # Set for this worker thread
-    ...
-    rows = run_sql(sql, token=token)  # Pass explicitly too
+    _tls.token = token
+    rows = run_sql(sql, token=token)
 
-# run_sql() priority: explicit param > _tls.token > flask_request (with try/except)
-def run_sql(stmt, params=None, token=None):
-    if not token:
-        token = getattr(_tls, "token", None)
-    if not token:
-        try:
-            token = flask_request.headers.get("x-forwarded-access-token")
-        except RuntimeError:  # "Working outside of request context"
-            token = None
+# run_sql() handles None data_array:
+data = resp.result.data_array if resp.result and resp.result.data_array else []
 ```
 
-**KEY BUG FIX**: `flask_request.headers.get(...)` RAISES `RuntimeError` in background threads. Must wrap in `try/except RuntimeError`. This applies to ALL functions that call `run_sql()` or access `flask_request` from non-request threads.
+**KEY**: `flask_request.headers.get(...)` RAISES `RuntimeError` in background threads. Must wrap in `try/except RuntimeError`.
 
 ---
 
-## 6. LLM Configuration
+## 7. LLM Configuration
 
-### Model Fallback Chain
-```python
-LLM_FALLBACK_CHAIN = [
-    "databricks-claude-opus-4-6",
-    "databricks-claude-opus-4-7",
-    "databricks-claude-opus-4-5",
-]
-```
+### Endpoint Discovery (_discover_endpoints)
+- Queries all serving endpoints, filters for `claude` in name
+- Sorts: Opus (tier 0) > Sonnet (tier 1) > Haiku (tier 2), version descending
+- **Version padding**: Tuples padded to 3 digits so `sonnet-4-6` → `(-4,-6,0)` sorts before `sonnet-4` → `(-4,0,0)`
+- Auto-refreshes every 5 minutes
 
-### _call_chat_model(prompt, token, max_tokens, model_chain=None)
-- Uses Foundation Model REST API: `POST /serving-endpoints/{model}/invocations`
-- NOT ai_query() (avoids SQL escaping issues)
-- Per model: on 429 → wait 15s, retry once, then fall back
-- On 500/502/503/timeout → immediately fall back
-- On 400/401/403 → raise (non-retryable)
+### _call_chat_model(prompt, token, max_tokens, model_chain)
+- REST API: `POST /serving-endpoints/{model}/invocations`
+- On 429: exponential backoff (15s → 30s → 60s), Opus gets 3 attempts
+- On 500/502/503: fall to next model
+- On 400 + prompt > 100K chars: raise `OverflowError` (triggers group split)
+- On 400 (other): raise `RuntimeError`
 
 ### _call_chat_model_race(prompt, token, max_tokens)
-- Fires SAME prompt to ALL 3 endpoints simultaneously
-- Returns first successful response
-- Used for: single-pass analysis (≤10 tables) and merge step
-- Latency = min(endpoint1, endpoint2, endpoint3)
+- Fires same prompt to all 3 Opus endpoints simultaneously
+- Returns first successful response, abandons losers
+- Used for: Reduce phase
+
+### Oversized Group Recovery
+When a group of 3 tables returns 400 (payload too large):
+1. `_analyze_one_group` catches `OverflowError`
+2. Splits group into individual table calls
+3. Each table gets its own LLM call
+4. Results merged back into single JSON response
+5. No tables are lost
 
 ### Parameters
 | Parameter | Value |
 |---|---|
-| max_tokens (single pass) | 32,000 |
-| max_tokens (group/merge) | 16,000 |
-| API timeout | 300s per call |
-| Parallelism (SQL profiling) | 20 workers |
-| Parallelism (LLM groups) | 12 workers (4 × 3 endpoints) |
-| Group size | 5 tables per group |
+| LLM_WORKERS | 20 |
+| LLM_GROUP_SIZE | 3 |
+| PROFILE_WORKERS | 20 |
+| MAX_TOKENS_SINGLE | 32,000 |
+| MAX_TOKENS_GROUP | 16,000 |
+| API_TIMEOUT | 300s |
 
 ---
 
-## 7. Profiling — Optimized for Speed
+## 8. Profiling
 
 ### Per-Table SQL (single query with TABLESAMPLE)
 ```sql
@@ -199,7 +253,7 @@ SELECT
   COUNT(*) AS __row_count__,
   COUNT(DISTINCT `col1`) AS dist__col1,
   SUM(CASE WHEN `col1` IS NULL THEN 1 ELSE 0 END) AS nulls__col1,
-  CAST(MIN(`date_col`) AS STRING) AS min__date_col,  -- DATE/TIMESTAMP only
+  CAST(MIN(`date_col`) AS STRING) AS min__date_col,
   CAST(MAX(`date_col`) AS STRING) AS max__date_col,
   (SELECT CONCAT_WS('|||', COLLECT_LIST(val))
    FROM (SELECT DISTINCT CAST(`str_col` AS STRING) AS val
@@ -207,213 +261,111 @@ SELECT
 FROM `catalog`.`schema`.`table` TABLESAMPLE (10 ROWS)
 ```
 
-### Row Count Strategy
-1. Try `DESCRIBE DETAIL table` (instant for Delta tables → `numRecords`)
-2. If fails (views): estimate from sample (if sampled_rows < 10 → actual, else × 1000)
-
-### Payload to LLM (build_profiling_payload)
-- Per column: name, type, null%, cardinality_ratio
-- min/max only for DATE/TIMESTAMP (LLM doesn't need INT ranges)
-- 3 sample values for top 4 string columns
-- Max payload: 25,000 chars
-
----
-
-## 8. LLM Prompt Templates
-
-### Single Pass (≤10 tables) — _analyze_single_pass
-```
-You are a senior data architect with 20 years of experience...
-Analyze schema from `{catalog}.{schema}` and design OPTIMAL dimensional model.
-
-RULES:
-1. Do NOT replicate existing tables. REDESIGN them.
-2. Use dim_ prefix for dimensions, fact_ for facts, bridge_ for bridges, agg_ for aggregates
-3. Every FK must reference a valid PK
-4. Be CONCISE in descriptions (≤15 words each)
-5. Action-verb relationship descriptions
-
-PROFILING DATA:
-{payload}
-
-Return ONLY valid JSON: { proposed_tables, relationships, columns_dropped,
-  data_summary, recommended_consumers }
-```
-
-### Group Analysis (>10 tables) — _analyze_table_group
-Same structure but for a subset of tables, with context about ALL table names in schema.
-
-### Merge Step — _merge_proposals
-Takes all group results, unifies into single model with cross-group relationships.
-
-### JSON Schema (Expected LLM Response)
-```json
-{
-  "proposed_tables": [{
-    "table_name": "dim_xxx",
-    "table_type": "fact|dimension|bridge|aggregate",
-    "description": "...",
-    "source_tables": ["original_table"],
-    "columns": [{
-      "name": "col_name",
-      "data_type": "STRING|LONG|DOUBLE|DATE|BOOLEAN",
-      "role": "pk|fk|measure|attribute",
-      "source": "original_table.column or generated",
-      "description": "..."
-    }]
-  }],
-  "relationships": [{
-    "from_table": "fact_xxx", "from_column": "key_col",
-    "to_table": "dim_xxx", "to_column": "key_col",
-    "cardinality": "1:N",
-    "description_english": "Each X has many Y"
-  }],
-  "columns_dropped": [{"source_table": "t", "column": "c", "reason": "why"}],
-  "data_summary": "3-4 sentences",
-  "recommended_consumers": ["Sales Analytics", "Finance"]
-}
-```
+### Per-Table Payloads (NO truncation)
+- `_profile_schema()` returns raw profiles list (not concatenated string)
+- `_build_per_table_payloads()` builds individual payloads per table
+- Each payload: header + table name + column profiles
+- ALL profiled tables reach the LLM (old 500K truncation eliminated)
 
 ---
 
 ## 9. UI Structure
 
 ### Layout (top to bottom)
-1. **Header bar**: Logo (36px) + "AI Data Model Designer" title + search input + "Export Report" button
-2. **Controls bar**: Catalog dropdown, Schema dropdown, Layout dropdown, "🤖 Generate Data Model" button
-3. **Main area**: Cytoscape graph (left, `calc(100vh - 180px)`) + Summary panel (right, 340px)
-4. **Zoom controls**: +/-/fit buttons overlaid top-right of graph
+1. **Controls bar**: Catalog dropdown, Schema dropdown, **Model Type radio** (3NF / Dimensional), Generate button
+2. **Main area**: Cytoscape graph (full width, `calc(100vh - 160px)`)
+3. **Legend bar**: Dynamic entity type dots (updates on model_type) + Export Report button
+4. **Summary panel**: Full width below graph
+5. **Zoom controls**: +/-/fit buttons overlaid on graph
 
-### Summary Panel Contents (right side)
-- Data summary text
-- Consumer badges
-- Proposed tables list with type badges
-- Relationships list with business descriptions
-- Dropped columns (collapsible)
+### Model Type Radio
+```python
+dcc.RadioItems(
+    id="model-type-radio",
+    options=[
+        {"label": " 3NF Relational", "value": "3nf"},
+        {"label": " Dimensional (Star)", "value": "dimensional"},
+    ],
+    value="3nf", inline=True,
+)
+```
+
+### Dynamic Legend
+- `update_legend()` callback: fires on `model-store` change
+- Returns colored dots + labels for the active model type
+- Export button is a SIBLING of legend-bar (not inside it) to avoid Dash callback conflicts
 
 ### Color Scheme
-| Element | Color | Hex |
-|---|---|---|
-| Fact tables | Blue | `#2563eb` |
-| Dimension tables | Green | `#16a34a` |
-| Bridge tables | Orange | `#ea580c` |
-| Aggregate tables | Purple | `#7c3aed` |
-| PK columns | Gold | `#eab308` |
-| FK columns | Blue | `#2563eb` |
-| Measure columns | Green | `#16a34a` |
-| Attribute columns | Gray | `#94a3b8` |
+| 3NF Type | Color | Dimensional Type | Color |
+|---|---|---|---|
+| Core Entity | #1e3a8a (Navy) | Fact | #2563eb (Blue) |
+| Weak Entity | #0ea5e9 (Sky Blue) | Dimension | #16a34a (Green) |
+| Associative | #f97316 (Orange) | Bridge | #ea580c (Deep Orange) |
+| Reference | #64748b (Slate) | Aggregate | #7c3aed (Purple) |
 
 ### Graph Configuration
 | Setting | Value |
 |---|---|
-| Default layout | Cola (force-directed) |
-| nodeSpacing | 80 |
-| edgeLengthVal | 150 |
-| maxSimulationTime | 2000ms |
-| animate | **false** (instant placement — critical for fit()) |
-| Node shape | round-rectangle, 200×56px |
-| Edge consolidation | ONE edge per table pair (shows "N relationships") |
+| Layout | Cola (force-directed) |
+| randomize | **true** (prevents linear chain convergence) |
+| nodeSpacing | 100 |
+| edgeLengthVal | 200 |
+| maxSimulationTime | 4000ms |
+| convergenceThreshold | 0.001 |
+| fit | true |
+| padding | 50 |
+| animate | **false** |
+| Node shape | round-rectangle, 220×60px |
+| Node font | Inter / Segoe UI, 12px, weight 600 |
+| Node shadows | blur=12, offset-y=4 |
+| Edge labels | text-background with roundrectangle shape |
+| Edge consolidation | ONE edge per table pair |
 
-### Auto-Fit Callback
-```javascript
-// Fires at 500ms, 1.5s, 3s, 5s after elements load
-function doFit() {
-    var cy = el._cyreg.cy;
-    cy.fit(undefined, 40);
-    cy.center();
-}
-```
-**CRITICAL**: `animate: false` on Cola layout. Without this, nodes move during 3s simulation and `fit()` catches a half-finished layout → only 1-2 nodes visible.
+### Visual Entity Differentiation
+| Type | Border Style |
+|---|---|
+| Core Entity / Fact | Solid, thick (3-3.5px) |
+| Weak Entity / Bridge | Dashed |
+| Reference / Aggregate | Dotted |
+| Associative / Dimension | Solid, medium |
 
 ---
 
-## 10. Real-Time Progress Overlay
+## 10. Parser (_parse_llm_json)
 
-### Architecture
-```
-Button click → captures token → starts daemon thread → shows modal
-dcc.Interval (1.2s) → polls _job dict → updates modal steps
-```
-
-### _job Dict Structure
+### Model-Type Aware Parsing
 ```python
-_job = {
-    "active": True/False,
-    "steps": [{"time": "HH:MM:SS", "status": "active|done|error", "msg": "..."}],
-    "result": {...},  # Set when complete
-    "error": "...",   # Set on failure
-    "cancelled": False,  # Kill switch
-    "start_time": datetime
-}
+def _parse_llm_json(raw, model_type="3nf"):
+    # Valid types per model
+    if model_type == "dimensional":
+        valid_types = {"fact", "dimension", "bridge", "aggregate"}
+    else:
+        valid_types = {"core_entity", "weak_entity", "associative", "reference"}
+    
+    # Valid roles per model
+    valid_roles = {"pk", "fk", "measure", "attribute"} if dimensional else {"pk", "fk", "attribute"}
 ```
 
-### Kill Switch
-- Red "✕ Stop" button in modal → sets `_job['cancelled'] = True`
-- Background thread checks at 2 points (before LLM call, before parse)
-- IST timestamps (Asia/Kolkata, UTC+5:30)
+### Fallback Logic (invalid types)
+- **3NF**: "bridge/link/junction" in name → associative, "ref/lkp/lookup" → reference, "_dep/detail/line" → weak_entity, else core_entity
+- **Dimensional**: "fact/fct" in name → fact, "bridge/link/junction" → bridge, "agg/summary" → aggregate, else dimension
 
 ---
 
-## 11. PDF Export — Multi-Page A3 Landscape
+## 11. PDF Export
 
-### Architecture
-- **Server-side** Python PDF generation with fpdf2
-- `_generate_consulting_report(model)` produces McKinsey-style consulting report
-- `_deep_sanitize()` recursively cleans all Unicode → ASCII for PDF compatibility
-- `dcc.Download` component for browser download
+### Server-Side Generation (fpdf2)
+- `_generate_consulting_report(model)` produces McKinsey-style report
+- Model-type aware: title, colors, type_order, role_labels all conditional
+- `_deep_sanitize()` cleans Unicode → ASCII for PDF compatibility
 
-### Page Structure
-| Page | Content |
-|---|---|
-| **1** | Cover: logo, catalog.schema title, metric badges, full ERD graph |
-| **2** | Executive summary, consumer badges, proposed tables overview table |
-| **3** | Relationships table with business descriptions |
-| **4+** | Table Specifications: per-table cards with column details |
-| **Last** | Dropped columns with reasons |
-
-### Table Spec Cards
-- Color-coded header bar (blue=fact, green=dim, orange=bridge, purple=agg)
-- Type badge + table name (dynamic width via `getTextWidth()`) + column count
-- Column table: Name (48mm), Data Type (30mm), Role (20mm), Source (55mm), Description (auto)
-- Role abbreviations: PK, FK, Measure, Attr (NOT full words — prevents wrapping)
-- `overflow: 'ellipsize'` on all columns
-
-### Font Sizes (minimum 9pt throughout)
-| Element | Size |
-|---|---|
-| Page title | 28pt |
-| Section headings | 15pt |
-| Body text | 13-14pt |
-| Table headers | 10-11pt |
-| Table body | 10pt |
-| Footer | 9pt |
-
-### Error Handling (CRITICAL)
-```javascript
-// cy.png() can fail silently → img.onload never fires → no PDF
-var png64 = null;
-try { png64 = cy.png({...}); } catch(e) { }
-
-function generatePDF(img) {
-  try {
-    // ... entire PDF generation ...
-    if (img) { doc.addImage(img, ...); }
-    else { doc.text('See interactive app view', ...); }
-    doc.save(fname);
-  } catch(pdfErr) {
-    alert('PDF export failed: ' + pdfErr.message);
-  }
-}
-
-if (png64) {
-  var img = new Image();
-  img.onload = function() { generatePDF(img); };
-  img.onerror = function() { generatePDF(null); };
-  img.src = png64;
-} else {
-  generatePDF(null);
-}
-```
+### Conditional Elements by Model Type
+| Element | 3NF | Dimensional |
+|---|---|---|
+| Title | "RELATIONAL DATA MODEL (3NF)" | "DIMENSIONAL DATA MODEL" |
+| Type Order | core_entity → weak_entity → associative → reference | fact → dimension → bridge → aggregate |
+| Role Labels | PK, FK, Attr | PK, FK, Measure, Attr |
+| Body Text | "3NF relational model" | "dimensional model (Kimball star schema)" |
 
 ---
 
@@ -421,15 +373,16 @@ if (png64) {
 
 | Decision | Rationale |
 |---|---|
-| REST API not ai_query() | Avoids SQL escaping, supports parallel calls, 300s timeout |
-| TABLESAMPLE (10 ROWS) | 10 rows enough for cardinality ratios; avoids full scans on views |
-| Explicit token passing | `threading.local()` doesn't inherit across ThreadPoolExecutor workers |
-| `animate: false` on Cola | Nodes must be at final positions for `fit()` to show all nodes |
-| Race mode for single calls | 3× better latency by racing all endpoints simultaneously |
-| Round-robin for groups | Even load distribution prevents rate limiting on any one endpoint |
-| Client-side PDF (jsPDF) | No server-side dependency; works with Cytoscape canvas export |
-| `try/except RuntimeError` around flask_request | Background threads crash without this guard |
-| Consolidated edges | One arrow per table pair prevents visual clutter |
+| Sonnet for Map, Opus for Reduce | Entity extraction is structurally simple (Sonnet is 3-5x faster). FK inference needs highest intelligence. |
+| group_size=3 | Balances parallelism (67 groups / 200 tables) with context richness |
+| Per-table payloads (no concat) | Eliminates the 500K MAX_PAYLOAD_CHARS truncation that silently dropped tables |
+| Programmatic merge (no LLM merge) | Instant, deterministic. Each Map call already has all_table_names context. |
+| Compressed catalog for Reduce | Only structure needed for FK inference. 200 tables ≈ 80K chars ≈ 20K tokens. |
+| Race mode for Reduce | Single high-stakes call. Racing 3 endpoints ensures fastest response. |
+| randomize: true on Cola | Without it, all nodes start at (0,0) and converge to a vertical line. |
+| OverflowError → group split | On 400 BAD_REQUEST, split oversized group into individual calls instead of failing. |
+| Export button outside legend-bar | Prevents Dash destroying/recreating the button when legend callback fires. |
+| Padded version sorting (3-digit) | Ensures `sonnet-4-6` correctly beats `sonnet-4` as "latest". Without padding, Python treats `(-4,)` < `(-4,-6)`. |
 
 ---
 
@@ -437,97 +390,40 @@ if (png64) {
 
 | Bug | Cause | Fix |
 |---|---|---|
-| "Working outside of request context" | `flask_request` accessed in background thread | Wrap in `try/except RuntimeError` |
-| "Profiled 0 tables" | Token not reaching worker threads | Pass token explicitly to `run_sql(token=...)` |
-| Only 1-2 nodes visible in graph | Cola `animate: true` + early `fit()` | Set `animate: false`, fit at 500ms/1.5s/3s/5s |
-| PDF export silently fails | `cy.png()` fails → `img.onload` never fires | Wrap in try/catch, use `generatePDF(null)` fallback |
-| "ATTRIBUTE" wrapping in PDF | 15mm Role column too narrow | Abbreviate to "Attr", widen to 20mm |
-| Text overlap in PDF tables | No overflow control | Add `overflow: 'ellipsize'` to all columns |
-| JSON parse error from LLM | Response has markdown fences | Strip fences + retry logic in `_parse_llm_json()` |
-| Full table scans on views | `COUNT(*)` materializes entire view | Use TABLESAMPLE only, DESCRIBE DETAIL for row count |
+| "Working outside of request context" | flask_request in background thread | try/except RuntimeError |
+| Only 35/116 tables sent to LLM | _build_profiling_payload truncated at 500K | _build_per_table_payloads (no truncation) |
+| Graph renders as vertical chain | Cola nodes all start at (0,0) | randomize: true |
+| 400 BAD_REQUEST on large groups | Group prompt exceeds context limit | OverflowError → auto-split |
+| "consumers" not defined in PDF | Leftover reference after removal | Removed all consumers references |
+| App UNAVAILABLE after deploy | update_legend recreated export-btn | export-btn moved outside legend-bar |
+| run_sql crashes on empty result | data_array is None | `data = resp.result.data_array if resp.result and resp.result.data_array else []` |
+| Old Sonnet models used in Map | Version sorting puts `sonnet-4` before `sonnet-4-6` | Pad version tuples to 3 digits: `(-4,0,0)` vs `(-4,-6,0)` |
+| Error label shows wrong model | Used LLM_FALLBACK_CHAIN for label | Use work_models instead |
 
 ---
 
-## 14. Deployment
-
-```python
-from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.apps import AppDeployment
-import datetime
-
-w = WorkspaceClient()
-result = w.apps.deploy(
-    app_name="ai-data-model-designer",
-    app_deployment=AppDeployment(
-        source_code_path="/Workspace/Users/<user>/ai-data-model-designer/app"
-    )
-).result(timeout=datetime.timedelta(minutes=5))
-print(result.status.state.value)
-```
-
-### Authorization Setup
-```python
-from databricks.sdk.service.apps import (
-    App, AppResource, AppResourceSqlWarehouse,
-    AppResourceSqlWarehouseSqlWarehousePermission,
-    AppResourceServingEndpoint,
-    AppResourceServingEndpointServingEndpointPermission,
-)
-
-w.apps.update(
-    name="ai-data-model-designer",
-    app=App(
-        name="ai-data-model-designer",
-        resources=[
-            AppResource(name="sql-warehouse", sql_warehouse=AppResourceSqlWarehouse(
-                id="<warehouse_id>",
-                permission=AppResourceSqlWarehouseSqlWarehousePermission.CAN_USE)),
-            AppResource(name="serving-endpoint", serving_endpoint=AppResourceServingEndpoint(
-                name="databricks-claude-opus-4-5",
-                permission=AppResourceServingEndpointServingEndpointPermission.CAN_QUERY)),
-        ],
-        user_api_scopes=["sql", "serving.serving-endpoints",
-                         "catalog.catalogs:read", "catalog.schemas:read", "catalog.tables:read"],
-    )
-)
-```
-
----
-
-## 15. Testing Checklist
+## 14. Testing Checklist
 
 - [ ] Select catalog/schema → tables populate
-- [ ] Click "Generate Data Model" → thinking modal appears with timestamped steps
-- [ ] Profiling shows "~X rows" (sampled, not full scan)
-- [ ] LLM analysis completes (check logs: "Race winner: opus-4.X in Xs")
-- [ ] All proposed tables visible in graph (not just 1-2)
+- [ ] Select **3NF Relational** → generates core_entity/weak_entity/associative/reference types
+- [ ] Select **Dimensional (Star)** → generates fact/dimension/bridge/aggregate types
+- [ ] All profiled tables appear in Map phase (no truncation)
+- [ ] Reduce phase shows relationships mapped via Opus
+- [ ] Cola layout renders proper 2D spread (not vertical chain)
+- [ ] Legend updates when switching model type
 - [ ] Click nodes → detail panel shows columns with role badges
-- [ ] Summary panel shows consumers, relationships, dropped columns
-- [ ] Export Report → PDF downloads with all pages
+- [ ] Summary panel shows Measures count for dimensional
+- [ ] Export Report → PDF downloads with correct title/colors
 - [ ] Kill switch (✕ Stop) aborts in-progress generation
-- [ ] Test on schema with 3 tables (single pass) and 20+ tables (parallel groups)
+- [ ] Test on small schema (3 tables) and large schema (100+ tables)
+- [ ] Verify Map phase uses latest Sonnet (e.g. sonnet-4-6, not sonnet-4)
 
 ---
 
-## 16. Performance Summary
-
-| Stage | Technique | Impact |
-|---|---|---|
-| SQL Profiling | TABLESAMPLE (10 ROWS) + 20 workers | ~35× less data scanned |
-| Row Count | DESCRIBE DETAIL (Delta) / estimate (views) | Eliminates full COUNT(*) |
-| LLM Single Pass | Race 3 endpoints simultaneously | Latency = fastest endpoint |
-| LLM Groups | Round-robin across 3 endpoints, 12 workers | 3× throughput |
-| LLM Merge | Race 3 endpoints | No sequential bottleneck |
-| Payload | Dropped distinct_count, DATE-only ranges | ~40% smaller prompts |
-| Graph Render | Cola animate=false + 4-stage fit() | All nodes visible instantly |
-
----
-
-## 17. Known Limitations
+## 15. Known Limitations
 
 1. Views don't support DESCRIBE DETAIL — row count estimated from sample
-2. PDF depends on CDN loading of jsPDF/autoTable scripts
-3. 200K token context handles ~100-150 tables max
-4. No DDL generation (proposes model but doesn't create tables)
-5. Single-schema scope (no cross-schema relationships)
-6. Claude Opus thinking time (~20-40s) is irreducible regardless of parallelism
+2. 200K token context handles ~200 tables max in Reduce phase
+3. No DDL generation (proposes model but doesn't create tables)
+4. Single-schema scope (no cross-schema relationships)
+5. Tables with 0 sample rows are excluded from Map phase (no data to model)

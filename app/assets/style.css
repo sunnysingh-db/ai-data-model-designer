@@ -122,6 +122,11 @@
 .badge-weak_entity { background: #0ea5e9; color: white; }
 .badge-associative { background: #f97316; color: white; }
 .badge-reference { background: #64748b; color: white; }
+/* Dimensional badges */
+.badge-fact { background: #2563eb; color: white; }
+.badge-dimension { background: #16a34a; color: white; }
+.badge-bridge { background: #ea580c; color: white; }
+.badge-aggregate { background: #7c3aed; color: white; }
 
 /* ===== Thinking Modal ===== */
 @keyframes pulse {
@@ -324,6 +329,7 @@
 /* ===== Column Role Badges ===== */
 .role-pk { background: #fef3c7; color: #92400e; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
 .role-fk { background: #dbeafe; color: #1d4ed8; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+.role-measure { background: #dcfce7; color: #15803d; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
 .role-attr { background: #f1f5f9; color: #475569; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
 
 /* ===== Powered by Databricks Footer ===== */
@@ -349,4 +355,18 @@
 
 .powered-footer img:hover {
   opacity: 1;
+}
+
+/* ===== Model Type Radio ===== */
+.model-type-radio {
+  display: flex;
+  gap: 0;
+}
+.model-type-radio label {
+  cursor: pointer;
+  transition: color 0.2s;
+}
+.model-type-radio input[type="radio"]:checked + label {
+  color: #1e3a8a;
+  font-weight: 700;
 }
