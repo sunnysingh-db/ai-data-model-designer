@@ -2,7 +2,7 @@
 
 > **Purpose**: Complete blueprint to rebuild the AI Data Model Designer app from scratch in any Databricks workspace.
 >
-> **Last Updated**: 2026-05-02
+> **Last Updated**: 2026-05-04
 > **Owner**: sunny.singh@databricks.com
 
 ---
@@ -12,10 +12,11 @@
 **What it is**: A Databricks App (Dash/Cytoscape) called **"AI Data Model Designer"** that:
 1. Reads live metadata from Unity Catalog (tables, columns, PKs, FKs)
 2. Profiles schema data via TABLESAMPLE (10 rows per table)
-3. Uses a **Map-Reduce LLM pattern**: Sonnet for parallel entity extraction (Map), Opus for global relationship inference (Reduce)
-4. Supports **dual model types**: 3NF Relational or Dimensional (Kimball Star Schema)
-5. Renders a color-coded interactive ERD graph with professional styling
-6. Exports a consulting-grade multi-page PDF report
+3. Uses a **Map-Reduce LLM pattern**: Sonnet for parallel entity extraction (Map), best Opus for global relationship inference (Reduce)
+4. Applies **multi-layer relationship detection**: LLM Reduce + heuristic FK matching (exact + suffix) + LLM rescue pass for orphaned entities
+5. Supports **dual model types**: 3NF Relational or Dimensional (Kimball Star Schema)
+6. Renders a **domain-clustered interactive ERD graph** with connected component detection and compound parent nodes
+7. Exports a consulting-grade multi-page PDF report
 
 **App Name**: `ai-data-model-designer`
 **Title**: "AI Data Model Designer"
@@ -31,7 +32,7 @@
 ├── README.md                   # Project documentation
 ├── SKILL.md                    # This file
 ├── app/                        # Databricks App (deployed from here)
-│   ├── app.py                  # Main Dash application (~2,970 lines, ~123KB, 60 functions)
+│   ├── app.py                  # Main Dash application (~3,200 lines, ~135KB)
 │   ├── app.yaml                # Databricks App config
 │   ├── requirements.txt        # Python dependencies (dash, dash-cytoscape, databricks-sdk, pandas, fpdf2)
 │   └── assets/
@@ -101,22 +102,38 @@ User selects Catalog + Schema + Model Type (3NF / Dimensional) → clicks Genera
   │   ├─ _build_per_table_payloads(): individual payloads from profiles (NO truncation)
   │   ├─ Groups of 3 tables (LLM_GROUP_SIZE=3)
   │   ├─ 20 workers, round-robin across latest Sonnet endpoint(s)
+  │   ├─ Naming convention rules enforced (singular, snake_case, <entity>_id PKs)
   │   ├─ On 400 BAD_REQUEST (oversized): auto-split into individual table calls
   │   └─ Programmatic merge: Python dedup by table_name (<1ms)
   │
-  ├─ Step 4: REDUCE PHASE (Opus, racing)
+  ├─ Step 4: REDUCE PHASE (Best Opus, single call)
   │   ├─ _build_schema_catalog(): compressed structure-only catalog (~400 chars/table)
   │   ├─ _build_reduce_prompt(): focused FK→PK inference prompt
-  │   ├─ _call_chat_model_race(): 3 Opus endpoints racing
+  │   ├─ _call_chat_model(): single best Opus (no racing — saves 2/3 cost)
+  │   ├─ Fallback chain: next Opus → Sonnet → Haiku
   │   └─ Validates: drops relationships to non-existent tables/columns
-  │   └─ Injects FK roles into columns
   │
-  ├─ Step 5: PARSE & VALIDATE
+  ├─ Step 5: HEURISTIC FK DETECTION (deterministic, instant)
+  │   ├─ _infer_heuristic_fks(proposed_tables, existing_rels)
+  │   ├─ Builds PK index: defaultdict(list) mapping column → ALL parent tables
+  │   ├─ EXACT match: X.restaurant_id = restaurant.restaurant_id
+  │   ├─ SUFFIX match: X.origin_airport_id ends with airport.airport_id
+  │   └─ Deduplicates against existing relationships
+  │
+  ├─ Step 6: LLM RESCUE PASS (Sonnet, targeted)
+  │   ├─ _rescue_orphans_via_llm(proposed_tables, existing_rels, token)
+  │   ├─ Identifies orphans: entities with 0 relationships after Reduce + heuristic
+  │   ├─ Builds mini-catalog: full details for orphans, PK-only for connected
+  │   ├─ Sonnet call (~5K chars prompt, fast/cheap)
+  │   └─ Catches semantic matches: origin_airport→airport, airline_code→airline
+  │
+  ├─ Step 7: PARSE & VALIDATE
   │   └─ _parse_llm_json(raw, model_type): type/role normalization, fallback logic
   │
-  └─ Step 6: RENDER
-      ├─ build_proposed_erd_elements() → Cytoscape nodes + edges
-      ├─ Cola layout with randomize=true, fit=true
+  └─ Step 8: RENDER
+      ├─ _detect_domain_clusters(): BFS connected component detection
+      ├─ build_proposed_erd_elements(): compound parent nodes per cluster
+      ├─ fcose layout with dynamic scaling (nodeRepulsion, componentSpacing)
       └─ Dynamic legend updates based on model_type
 ```
 
@@ -125,7 +142,31 @@ User selects Catalog + Schema + Model Type (3NF / Dimensional) → clicks Genera
 | Phase | Primary | Fallback | Rationale |
 |---|---|---|---|
 | **Map** | Latest Sonnet only (version-filtered) | Older Sonnet → Opus → Haiku | Fast, cheap structured extraction |
-| **Reduce** | Top 3 Opus (racing) | Sonnet → Haiku | High-stakes cross-entity reasoning |
+| **Reduce** | Best single Opus (no racing) | Next Opus → Sonnet → Haiku | High-intelligence reasoning; cost-efficient |
+| **Rescue** | Latest Sonnet (via map pool) | Older Sonnet → Opus → Haiku | Cheap/fast for small targeted prompt |
+
+### Multi-Layer Relationship Detection
+
+| Layer | Function | Type | What It Catches | Example |
+|---|---|---|---|---|
+| 1. Opus Reduce | `_map_global_relationships` | LLM | Cross-entity FK→PK via reasoning | `order.customer_id → customer.customer_id` |
+| 2. Heuristic (Exact) | `_infer_heuristic_fks` | Deterministic | Column name = PK name | `payment.order_id → order.order_id` |
+| 3. Heuristic (Suffix) | `_infer_heuristic_fks` | Deterministic | Column ends with `_` + PK name | `flight.origin_airport_id → airport.airport_id` |
+| 4. LLM Rescue | `_rescue_orphans_via_llm` | LLM (Sonnet) | Semantic matches for non-standard naming | `flights.airline_code → airline.iata_code` |
+
+### PK Index Design (CRITICAL)
+
+The heuristic FK detection uses `defaultdict(list)` for the PK index:
+
+```python
+pk_index = defaultdict(list)  # column_name -> [table1, table2, ...]
+for t in proposed_tables:
+    for c in t.get("columns", []):
+        if c.get("role", "").lower() == "pk":
+            pk_index[c["name"]].append(t["table_name"])
+```
+
+**Why not a plain dict?** With 116 tables, multiple tables may share the same PK column name (e.g., both `orders.order_id` and `vcom_orders.order_id` are PKs). A plain dict would overwrite `"orders"` with `"vcom_orders"` (last-one-wins), causing `payments.order_id` to link to the wrong table.
 
 ### Endpoint Discovery & Version Sorting
 
@@ -139,11 +180,26 @@ User selects Catalog + Schema + Model Type (3NF / Dimensional) → clicks Genera
 
 Auto-refreshes every 5 minutes.
 
+### Progress Callbacks
+
+The `_map_global_relationships` function accepts a `progress_cb` parameter (wired to `_add_step` in `_bg_generate`). This emits 8 UI progress steps throughout the Reduce phase:
+
+1. 🧠 Calling opus-4-7 for global FK→PK mapping...
+2. 🏆 opus-4-7 responded — X chars
+3. 🔍 Parsing relationship JSON...
+4. ✅ Validating X proposed relationships against entity schema...
+5. ✅ X valid LLM relationships (Y dropped)
+6. 🔗 Running heuristic FK detection (exact + suffix matching)...
+7. 🔍 Scanning for orphaned entities...
+8. 🚑 Rescue pass connected X orphaned entities
+
+**Why this matters**: Without these callbacks, the UI shows no updates between "Opus responded" and "Reduce complete" — a gap of 10-60 seconds that makes the app appear stuck.
+
 ### Throughput (200 tables)
 | Config | Map Time | Reduce Time | Total |
 |---|---|---|---|
-| Old (all Opus, group_size=1) | \~11 min | N/A | \~11 min |
-| New (Sonnet Map + Opus Reduce) | \~1.5 min | \~45s | **\~2.5 min** |
+| Old (all Opus, group_size=1) | ~11 min | N/A | ~11 min |
+| New (Sonnet Map + single Opus Reduce) | ~1.5 min | ~45s | **~2.5 min** |
 
 ---
 
@@ -157,6 +213,7 @@ Auto-refreshes every 5 minutes.
 - Entity types: `core_entity`, `weak_entity`, `associative`, `reference`
 - Column roles (Map): `pk`, `attribute` (FKs deferred to Reduce)
 - Prompts: "Normalize to strict 3NF. Eliminate transitive dependencies."
+- **Naming conventions**: Singular nouns, snake_case, `<entity>_id` PKs, `_type`/`_status` suffixes for reference tables
 - Reduce: FK→PK inference for relational integrity
 
 ### Dimensional (Kimball) Mode
@@ -166,11 +223,22 @@ Auto-refreshes every 5 minutes.
 - Naming convention: `fact_`, `dim_`, `bridge_`, `agg_` prefixes
 - Reduce: Fact→Dimension joins, bridge links
 
+### Naming Conventions (enforced in prompts)
+
+Both `_build_analysis_prompt` and `_build_group_prompt` include Rule 3 — NAMING CONVENTIONS:
+- Singular nouns (`order`, not `orders`; `restaurant`, not `restaurants`)
+- snake_case, no abbreviations
+- PK: `<entity>_id` (e.g. `order_id` for `order` entity)
+- Reference tables: `_type`/`_status` suffix (e.g. `order_status`)
+- FK columns match parent PK name
+
+**Dual benefit**: Improves table names for users AND makes the suffix heuristic more effective (ensures columns follow `_id` pattern).
+
 ### Parameterized Functions
 | Function | model_type behavior |
 |---|---|
-| `_build_system_prompt(mt)` | "3NF specialist" vs "Kimball methodology expert" |
-| `_build_analysis_prompt(mt)` | Different rules, entity types, role options, JSON schema |
+| `_build_system_prompt(mt)` | "3NF specialist" vs "Kimball methodology expert" + RECOMMEND guidance |
+| `_build_analysis_prompt(mt)` | Different rules, entity types, role options, naming conventions, JSON schema |
 | `_build_group_prompt(mt)` | Same as analysis, for groups of 3 tables |
 | `_build_reduce_prompt(mt)` | "relational integrity" vs "star schema joins" |
 | `_parse_llm_json(raw, mt)` | Valid types/roles differ; fallback logic differs |
@@ -221,9 +289,17 @@ data = resp.result.data_array if resp.result and resp.result.data_array else []
 - On 400 (other): raise `RuntimeError`
 
 ### _call_chat_model_race(prompt, token, max_tokens)
-- Fires same prompt to all 3 Opus endpoints simultaneously
-- Returns first successful response, abandons losers
-- Used for: Reduce phase
+- Fires same prompt to selected endpoints simultaneously
+- Returns first successful response, abandons losers via `pool.shutdown(wait=False, cancel_futures=True)`
+- Background timer updates UI every 10s during race
+- **No longer used for Reduce phase** — Reduce now uses single `_call_chat_model` call
+- Still available for other use cases if needed
+
+### Cost Optimization (Single Opus for Reduce)
+- **Old**: `_call_chat_model_race` fired 3 Opus endpoints simultaneously, paying for all 3
+- **New**: `_call_chat_model` with `model_chain=[best_opus] + fallback`
+- **Savings**: 2/3 reduction in Opus token cost per Reduce call
+- Fallback chain still handles errors (if opus-4-7 fails, tries next Opus, then Sonnet)
 
 ### Oversized Group Recovery
 When a group of 3 tables returns 400 (payload too large):
@@ -269,7 +345,57 @@ FROM `catalog`.`schema`.`table` TABLESAMPLE (10 ROWS)
 
 ---
 
-## 9. UI Structure
+## 9. Heuristic FK Detection
+
+### _infer_heuristic_fks(proposed_tables, existing_rels)
+
+Deterministic, instant (<1ms). Runs after Opus Reduce to catch obvious matches the LLM missed.
+
+**Strategy 1 — EXACT match**:
+```
+For each table T, for each column C where C.name == PK.name in another table:
+  → T.C → Parent.PK (if not self-referencing and not already in existing_rels)
+```
+Example: `payment.order_id` = `order.order_id` → `payment.order_id → order.order_id`
+
+**Strategy 2 — SUFFIX match**:
+```
+For each table T, for each column C where C.name ends with "_" + PK.name:
+  → T.C → Parent.PK (if len(C.name) > len(PK.name) + 1)
+```
+Example: `flight.origin_airport_id` ends with `_airport_id` → `flight.origin_airport_id → airport.airport_id`
+
+**PK Index** (defaultdict(list)):
+```python
+pk_index = defaultdict(list)
+for t in proposed_tables:
+    for c in t.get("columns", []):
+        if c.get("role", "").lower() == "pk":
+            pk_index[c["name"]].append(t["table_name"])
+```
+
+Using `defaultdict(list)` is critical — a plain dict would overwrite when multiple tables share the same PK column name (e.g., `orders.order_id` and `vcom_orders.order_id`).
+
+---
+
+## 10. LLM Rescue Pass
+
+### _rescue_orphans_via_llm(proposed_tables, existing_rels, token, model_type)
+
+After Opus Reduce + heuristic, some entities may still have ZERO relationships — especially with non-standard naming (e.g., `origin_airport` instead of `airport_id`, `airline_code` instead of `airline_id`, SAP-style `Vendor_Code`).
+
+**Flow**:
+1. Identify orphans: entities in `all_table_names - connected`
+2. Build mini-catalog: full column details for orphans, PK-only summary for connected entities
+3. Call Sonnet with focused prompt (~5K chars) asking for semantic FK→PK relationships
+4. Validate against entity schema (same logic as Opus validation)
+5. Deduplicate against existing relationships
+
+**Cost**: Much cheaper than full Reduce — typically <5K chars prompt vs 80K+ for the full catalog.
+
+---
+
+## 11. UI Structure
 
 ### Layout (top to bottom)
 1. **Controls bar**: Catalog dropdown, Schema dropdown, **Model Type radio** (3NF / Dimensional), Generate button
@@ -278,22 +404,50 @@ FROM `catalog`.`schema`.`table` TABLESAMPLE (10 ROWS)
 4. **Summary panel**: Full width below graph
 5. **Zoom controls**: +/-/fit buttons overlaid on graph
 
-### Model Type Radio
-```python
-dcc.RadioItems(
-    id="model-type-radio",
-    options=[
-        {"label": " 3NF Relational", "value": "3nf"},
-        {"label": " Dimensional (Star)", "value": "dimensional"},
-    ],
-    value="3nf", inline=True,
-)
-```
+### Domain-Clustered Graph Layout
 
-### Dynamic Legend
-- `update_legend()` callback: fires on `model-store` change
-- Returns colored dots + labels for the active model type
-- Export button is a SIBLING of legend-bar (not inside it) to avoid Dash callback conflicts
+**Connected Component Detection** (`_detect_domain_clusters`):
+- BFS traversal on relationship edges
+- Each connected component = one domain cluster
+- Isolated nodes (no relationships) get their own cluster
+
+**Compound Parent Nodes**:
+- Each cluster with >1 node gets a compound parent node
+- Domain naming via keyword matching:
+  - `flight`/`airline`/`airport` → "Aviation"
+  - `order`/`restaurant`/`payment` → "Orders"
+  - `procurement`/`contract`/`vendor` → "Procurement"
+  - etc.
+- Parent nodes styled: dashed border, light background, domain label at top
+
+**fcose Layout** (replaced Cola):
+- Natively handles compound nodes — places each cluster in its own region
+- `componentSpacing` separates disconnected clusters
+- **Dynamic scaling** based on entity count:
+  ```python
+  _n = len(elements)
+  _repulsion = max(15000, _n * 200)   # More entities → more repulsion
+  _spacing = max(400, _n * 5)          # More entities → more inter-cluster spacing
+  _edge_len = max(250, _n * 3)         # More entities → longer edges
+  ```
+
+### Graph Configuration
+| Setting | Value |
+|---|---|
+| Layout | **fcose** (force-directed with compound node support) |
+| randomize | true |
+| quality | "proof" (highest quality) |
+| nodeRepulsion | 15000+ (dynamic: N×200) |
+| idealEdgeLength | 250+ (dynamic: N×3) |
+| componentSpacing | 400+ (dynamic: N×5) |
+| nestingFactor | 0.1 |
+| gravity | 0.08 |
+| gravityRange | 5.0 |
+| fit | true |
+| padding | 80 |
+| animate | false |
+| Node shape | round-rectangle, 200×56px |
+| Edge consolidation | ONE edge per table pair |
 
 ### Color Scheme
 | 3NF Type | Color | Dimensional Type | Color |
@@ -303,35 +457,9 @@ dcc.RadioItems(
 | Associative | #f97316 (Orange) | Bridge | #ea580c (Deep Orange) |
 | Reference | #64748b (Slate) | Aggregate | #7c3aed (Purple) |
 
-### Graph Configuration
-| Setting | Value |
-|---|---|
-| Layout | Cola (force-directed) |
-| randomize | **true** (prevents linear chain convergence) |
-| nodeSpacing | 100 |
-| edgeLengthVal | 200 |
-| maxSimulationTime | 4000ms |
-| convergenceThreshold | 0.001 |
-| fit | true |
-| padding | 50 |
-| animate | **false** |
-| Node shape | round-rectangle, 220×60px |
-| Node font | Inter / Segoe UI, 12px, weight 600 |
-| Node shadows | blur=12, offset-y=4 |
-| Edge labels | text-background with roundrectangle shape |
-| Edge consolidation | ONE edge per table pair |
-
-### Visual Entity Differentiation
-| Type | Border Style |
-|---|---|
-| Core Entity / Fact | Solid, thick (3-3.5px) |
-| Weak Entity / Bridge | Dashed |
-| Reference / Aggregate | Dotted |
-| Associative / Dimension | Solid, medium |
-
 ---
 
-## 10. Parser (_parse_llm_json)
+## 12. Parser (_parse_llm_json)
 
 ### Model-Type Aware Parsing
 ```python
@@ -352,7 +480,7 @@ def _parse_llm_json(raw, model_type="3nf"):
 
 ---
 
-## 11. PDF Export
+## 13. PDF Export
 
 ### Server-Side Generation (fpdf2)
 - `_generate_consulting_report(model)` produces McKinsey-style report
@@ -369,47 +497,65 @@ def _parse_llm_json(raw, model_type="3nf"):
 
 ---
 
-## 12. Key Design Decisions
+## 14. Key Design Decisions
 
 | Decision | Rationale |
 |---|---|
-| Sonnet for Map, Opus for Reduce | Entity extraction is structurally simple (Sonnet is 3-5x faster). FK inference needs highest intelligence. |
+| Sonnet for Map, single Opus for Reduce | Entity extraction is structurally simple (Sonnet is 3-5x faster). FK inference needs highest intelligence. No racing saves 2/3 cost. |
+| Multi-layer relationship detection | LLM + heuristic + rescue catches standard naming, suffix patterns, AND semantic matches |
+| `defaultdict(list)` PK index | Handles schemas where multiple tables share the same PK column name (e.g., `order_id`) |
+| Naming conventions in prompts | LLM recommends `<entity>_id` pattern, making suffix heuristic more effective |
+| Domain-clustered fcose layout | Connected component detection groups related entities; compound nodes prevent cross-domain overlap |
+| Dynamic layout scaling | `nodeRepulsion` and `componentSpacing` scale with entity count for large schemas |
 | group_size=3 | Balances parallelism (67 groups / 200 tables) with context richness |
 | Per-table payloads (no concat) | Eliminates the 500K MAX_PAYLOAD_CHARS truncation that silently dropped tables |
 | Programmatic merge (no LLM merge) | Instant, deterministic. Each Map call already has all_table_names context. |
 | Compressed catalog for Reduce | Only structure needed for FK inference. 200 tables ≈ 80K chars ≈ 20K tokens. |
-| Race mode for Reduce | Single high-stakes call. Racing 3 endpoints ensures fastest response. |
-| randomize: true on Cola | Without it, all nodes start at (0,0) and converge to a vertical line. |
+| Progress callbacks in Reduce | 8 `_add_step` calls prevent UI stall between Opus response and final result |
+| LLM rescue for orphans only | Cheap/fast — only processes disconnected entities, not the full 100+ table catalog |
+| randomize: true on fcose | Without it, all nodes start at (0,0) and converge to a vertical line. |
 | OverflowError → group split | On 400 BAD_REQUEST, split oversized group into individual calls instead of failing. |
 | Export button outside legend-bar | Prevents Dash destroying/recreating the button when legend callback fires. |
 | Padded version sorting (3-digit) | Ensures `sonnet-4-6` correctly beats `sonnet-4` as "latest". Without padding, Python treats `(-4,)` < `(-4,-6)`. |
 
 ---
 
-## 13. Common Bugs & Fixes
+## 15. Common Bugs & Fixes
 
 | Bug | Cause | Fix |
 |---|---|---|
+| payments.order_id linked to wrong table | PK index used plain dict; `vcom_orders` overwrote `orders` | Changed to `defaultdict(list)` for multi-valued PK index |
+| Airport entity disconnected from flights | `origin_airport_id` ≠ `airport_id` (no exact match) | Added SUFFIX matching: `origin_airport_id` ends with `_airport_id` |
+| Non-standard FK naming missed (airline_code) | Heuristic only does pattern matching; semantic patterns need LLM | Added LLM rescue pass for orphaned entities |
+| Graph nodes overlap across domains | Cola layout treats all nodes equally; no domain clustering | Switched to fcose with connected component detection + compound parent nodes |
+| Progress stalls after Opus responds | No `_add_step` calls between Opus response and Reduce complete | Added 8 progress callbacks throughout `_map_global_relationships` |
+| 3x Opus cost on Reduce | `_call_chat_model_race` fired 3 endpoints simultaneously | Changed to single `_call_chat_model` with fallback chain |
+| LLM returns plural table names | No naming convention guidance in prompts | Added NAMING CONVENTIONS rule to system and analysis prompts |
 | "Working outside of request context" | flask_request in background thread | try/except RuntimeError |
 | Only 35/116 tables sent to LLM | _build_profiling_payload truncated at 500K | _build_per_table_payloads (no truncation) |
-| Graph renders as vertical chain | Cola nodes all start at (0,0) | randomize: true |
+| Graph renders as vertical chain | Nodes all start at (0,0) | randomize: true |
 | 400 BAD_REQUEST on large groups | Group prompt exceeds context limit | OverflowError → auto-split |
-| "consumers" not defined in PDF | Leftover reference after removal | Removed all consumers references |
 | App UNAVAILABLE after deploy | update_legend recreated export-btn | export-btn moved outside legend-bar |
 | run_sql crashes on empty result | data_array is None | `data = resp.result.data_array if resp.result and resp.result.data_array else []` |
-| Old Sonnet models used in Map | Version sorting puts `sonnet-4` before `sonnet-4-6` | Pad version tuples to 3 digits: `(-4,0,0)` vs `(-4,-6,0)` |
-| Error label shows wrong model | Used LLM_FALLBACK_CHAIN for label | Use work_models instead |
+| Old Sonnet models used in Map | Version sorting puts `sonnet-4` before `sonnet-4-6` | Pad version tuples to 3 digits |
+| Duplicate function definitions | Earlier edits left orphaned copies | Cleaned up — single copy of each function |
 
 ---
 
-## 14. Testing Checklist
+## 16. Testing Checklist
 
 - [ ] Select catalog/schema → tables populate
 - [ ] Select **3NF Relational** → generates core_entity/weak_entity/associative/reference types
 - [ ] Select **Dimensional (Star)** → generates fact/dimension/bridge/aggregate types
 - [ ] All profiled tables appear in Map phase (no truncation)
-- [ ] Reduce phase shows relationships mapped via Opus
-- [ ] Cola layout renders proper 2D spread (not vertical chain)
+- [ ] Table names follow naming conventions (singular, snake_case, `<entity>_id` PKs)
+- [ ] Reduce phase shows single Opus call (not racing)
+- [ ] Progress updates throughout Reduce: validation, heuristic, rescue steps visible
+- [ ] Heuristic FK detection finds exact + suffix matches
+- [ ] LLM rescue pass connects orphaned entities
+- [ ] Domain clusters visible: related entities grouped in dashed containers
+- [ ] Unrelated domains (e.g., Aviation vs Orders) visually separated
+- [ ] Layout scales properly for large schemas (100+ entities)
 - [ ] Legend updates when switching model type
 - [ ] Click nodes → detail panel shows columns with role badges
 - [ ] Summary panel shows Measures count for dimensional
@@ -420,10 +566,12 @@ def _parse_llm_json(raw, model_type="3nf"):
 
 ---
 
-## 15. Known Limitations
+## 17. Known Limitations
 
 1. Views don't support DESCRIBE DETAIL — row count estimated from sample
 2. 200K token context handles ~200 tables max in Reduce phase
 3. No DDL generation (proposes model but doesn't create tables)
 4. Single-schema scope (no cross-schema relationships)
 5. Tables with 0 sample rows are excluded from Map phase (no data to model)
+6. Domain cluster naming uses keyword heuristic — may not label every domain correctly
+7. Rescue pass only targets entities with 0 relationships (partially-connected entities not rescued)

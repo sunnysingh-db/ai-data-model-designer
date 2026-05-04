@@ -153,10 +153,10 @@ def _refresh_endpoints_if_stale():
 
 
 def _get_model_pools():
-    """Return tiered model pools: Sonnet for Map, Opus for Reduce.
+    """Return tiered model pools: Sonnet for Map, best Opus for Reduce.
 
     Map pool:  Only the LATEST Sonnet endpoint(s) — older versions go to fallback.
-    Reduce pool: Latest Opus endpoints (high intelligence for cross-entity reasoning).
+    Reduce pool: Single best Opus endpoint (no racing — saves cost).
 
     Fallback: Map falls back to older Sonnet → Opus → Haiku.
               Reduce falls back to Sonnet → Haiku.
@@ -193,8 +193,8 @@ def _get_model_pools():
     older_sonnet = [m for m in sonnet_models if m not in map_primary]
     map_fallback = older_sonnet + [m for m in opus_models + haiku_models if m not in map_primary]
 
-    # --- Reduce pool: latest Opus (up to 3 for racing) ---
-    reduce_primary = opus_models[:3] if opus_models else sonnet_models[:3]
+    # --- Reduce pool: best single Opus (no racing — saves cost) ---
+    reduce_primary = opus_models[:1] if opus_models else sonnet_models[:1]
     reduce_fallback = [m for m in sonnet_models + haiku_models if m not in reduce_primary]
 
     return {
@@ -651,11 +651,15 @@ def _build_system_prompt(model_type="3nf"):
             "You are a senior enterprise data architect with 20 years of experience in dimensional modeling "
             "using the Kimball methodology. You specialize in star schemas, snowflake schemas, fact tables, "
             "dimension tables, bridge tables, and aggregate tables. "
+            "Your job is to RECOMMEND a best-practice dimensional model — not merely echo existing table names. "
+            "Rename tables and columns to follow professional Kimball naming conventions. "
             "You are precise, thorough, and always produce valid JSON."
         )
     return (
         "You are a senior enterprise data architect with 20 years of experience in relational database design, "
         "3rd Normal Form normalization, and Entity-Relationship modeling. "
+        "Your job is to RECOMMEND a best-practice data model — not merely echo existing table names. "
+        "Rename tables and columns to follow professional naming conventions. "
         "You are precise, thorough, and always produce valid JSON."
     )
 
@@ -695,21 +699,28 @@ def _build_analysis_prompt(payload, catalog, schema, model_type="3nf"):
     }
   ],
   "columns_dropped": [{"source_table": "t", "column": "c", "reason": "why"}],
-  "data_summary": "3-4 sentences summarizing the data domain and model rationale."
+  "data_summary": "3-5 sentences written for a BUSINESS ANALYST audience (not engineers). Describe: what business domain this data represents, what key business processes or activities are tracked, what business questions this data can answer, and how the entities relate in business terms. Use plain language — say 'tracks customer orders and delivery status' not 'normalized transactional entity with surrogate keys'. Avoid technical jargon like canonical, discriminator, denormalized, surrogate, natural key, projection."
 }"""
         intro = f"Analyze the following schema from `{catalog}`.`{schema}` and design a dimensional model (Kimball star schema)."
     else:
         rules = """RULES:
 1. Normalize to strict 3rd Normal Form. Eliminate all transitive dependencies.
 2. Classify each entity as exactly ONE of: core_entity, weak_entity, associative, reference.
-   - core_entity: Independent entities with strong PKs (e.g. customers, products, orders)
-   - weak_entity: Entities that depend on a parent for identity (e.g. order_lines, addresses)
-   - associative: Junction tables resolving M:N relationships (e.g. student_courses)
-   - reference: Lookup/code tables with low cardinality, rarely changing (e.g. status_codes, countries)
-3. Column roles must be ONLY: pk or attribute. Do NOT extract FK relationships in this step.
-4. Be CONCISE in descriptions (15 words max each).
-5. Normalize data types to: STRING, LONG, DOUBLE, DATE, BOOLEAN, TIMESTAMP.
-6. Do NOT include a "relationships" array — relationships will be determined globally in a later step."""
+   - core_entity: Independent entities with strong PKs (e.g. customer, product, order)
+   - weak_entity: Entities that depend on a parent for identity (e.g. order_line, address)
+   - associative: Junction tables resolving M:N relationships (e.g. student_course)
+   - reference: Lookup/code tables with low cardinality, rarely changing (e.g. order_status, country)
+3. NAMING CONVENTIONS — this is a RECOMMENDED model, not a mirror of existing tables:
+   a. Use SINGULAR nouns for entity names (order, not orders; restaurant, not restaurants; payment, not payments).
+   b. Use snake_case (lowercase with underscores).
+   c. PK column: <entity_name>_id (e.g. order_id for the order entity).
+   d. Reference/lookup tables: use _type, _status, or _category suffix (e.g. payment_method_type, order_status).
+   e. Keep names descriptive — no abbreviations (delivery_driver, not dd).
+   f. FK columns should match the PK name of the referenced entity (e.g. order.restaurant_id references restaurant.restaurant_id).
+4. Column roles must be ONLY: pk or attribute. Do NOT extract FK relationships in this step.
+5. Be CONCISE in descriptions (15 words max each).
+6. Normalize data types to: STRING, LONG, DOUBLE, DATE, BOOLEAN, TIMESTAMP.
+7. Do NOT include a "relationships" array — relationships will be determined globally in a later step."""
         json_tmpl = """{
   "proposed_tables": [
     {
@@ -729,7 +740,7 @@ def _build_analysis_prompt(payload, catalog, schema, model_type="3nf"):
     }
   ],
   "columns_dropped": [{"source_table": "t", "column": "c", "reason": "why"}],
-  "data_summary": "3-4 sentences summarizing the data domain and model rationale."
+  "data_summary": "3-5 sentences written for a BUSINESS ANALYST audience (not engineers). Describe: what business domain this data represents, what key business processes or activities are tracked, what business questions this data can answer, and how the entities relate in business terms. Use plain language — say 'tracks customer orders and delivery status' not 'normalized transactional entity with surrogate keys'. Avoid technical jargon like canonical, discriminator, denormalized, surrogate, natural key, projection."
 }"""
         intro = f"Analyze the following schema from `{catalog}`.`{schema}` and design a strictly normalized 3NF relational model."
 
@@ -783,21 +794,28 @@ def _build_group_prompt(payload, catalog, schema, all_table_names, model_type="3
     }
   ],
   "columns_dropped": [{"source_table": "t", "column": "c", "reason": "why"}],
-  "data_summary": "3-4 sentences summarizing the data domain and model rationale."
+  "data_summary": "3-5 sentences written for a BUSINESS ANALYST audience (not engineers). Describe: what business domain this data represents, what key business processes or activities are tracked, what business questions this data can answer, and how the entities relate in business terms. Use plain language — say 'tracks customer orders and delivery status' not 'normalized transactional entity with surrogate keys'. Avoid technical jargon like canonical, discriminator, denormalized, surrogate, natural key, projection."
 }"""
         intro = f"Analyze the following tables and propose a dimensional model (Kimball star schema)."
     else:
         rules = """RULES:
 1. Normalize to strict 3rd Normal Form. Eliminate all transitive dependencies.
 2. Classify each entity as exactly ONE of: core_entity, weak_entity, associative, reference.
-   - core_entity: Independent entities with strong PKs (e.g. customers, products, orders)
-   - weak_entity: Entities that depend on a parent for identity (e.g. order_lines, addresses)
-   - associative: Junction tables resolving M:N relationships (e.g. student_courses)
-   - reference: Lookup/code tables with low cardinality, rarely changing (e.g. status_codes, countries)
-3. Column roles must be ONLY: pk or attribute. Do NOT extract FK relationships in this step.
-4. Be CONCISE in descriptions (15 words max each).
-5. Normalize data types to: STRING, LONG, DOUBLE, DATE, BOOLEAN, TIMESTAMP.
-6. Do NOT include a "relationships" array — relationships will be determined globally in a later step."""
+   - core_entity: Independent entities with strong PKs (e.g. customer, product, order)
+   - weak_entity: Entities that depend on a parent for identity (e.g. order_line, address)
+   - associative: Junction tables resolving M:N relationships (e.g. student_course)
+   - reference: Lookup/code tables with low cardinality, rarely changing (e.g. order_status, country)
+3. NAMING CONVENTIONS — this is a RECOMMENDED model, not a mirror of existing tables:
+   a. Use SINGULAR nouns for entity names (order, not orders; restaurant, not restaurants; payment, not payments).
+   b. Use snake_case (lowercase with underscores).
+   c. PK column: <entity_name>_id (e.g. order_id for the order entity).
+   d. Reference/lookup tables: use _type, _status, or _category suffix (e.g. payment_method_type, order_status).
+   e. Keep names descriptive — no abbreviations (delivery_driver, not dd).
+   f. FK columns should match the PK name of the referenced entity (e.g. order.restaurant_id references restaurant.restaurant_id).
+4. Column roles must be ONLY: pk or attribute. Do NOT extract FK relationships in this step.
+5. Be CONCISE in descriptions (15 words max each).
+6. Normalize data types to: STRING, LONG, DOUBLE, DATE, BOOLEAN, TIMESTAMP.
+7. Do NOT include a "relationships" array — relationships will be determined globally in a later step."""
         json_tmpl = """{
   "proposed_tables": [
     {
@@ -817,7 +835,7 @@ def _build_group_prompt(payload, catalog, schema, all_table_names, model_type="3
     }
   ],
   "columns_dropped": [{"source_table": "t", "column": "c", "reason": "why"}],
-  "data_summary": "3-4 sentences summarizing the data domain and model rationale."
+  "data_summary": "3-5 sentences written for a BUSINESS ANALYST audience (not engineers). Describe: what business domain this data represents, what key business processes or activities are tracked, what business questions this data can answer, and how the entities relate in business terms. Use plain language — say 'tracks customer orders and delivery status' not 'normalized transactional entity with surrogate keys'. Avoid technical jargon like canonical, discriminator, denormalized, surrogate, natural key, projection."
 }"""
         intro = "Analyze the following tables and propose normalized 3NF entity definitions."
 
@@ -930,13 +948,240 @@ Return ONLY valid JSON:
 
 Return ONLY the JSON. No markdown fences. No extra text."""
 
-def _map_global_relationships(proposed_tables, catalog, schema, token, model_type="3nf"):
-    """Reduce phase: Use Opus to infer all FK→PK relationships globally.
+
+def _infer_heuristic_fks(proposed_tables, existing_rels):
+    """Deterministic FK detection: catch obvious column-name matches the LLM missed.
+
+    Two matching strategies:
+    1. EXACT match: column `X_id` matches table with PK `X_id`
+       e.g. order.restaurant_id → restaurant.restaurant_id
+    2. SUFFIX match: column `prefix_X_id` ends with PK `X_id`
+       e.g. flight.origin_airport_id → airport.airport_id
+       e.g. flight.destination_airport_id → airport.airport_id
+
+    Uses a multi-valued PK index (column → [tables]) to handle schemas where
+    multiple tables share the same PK column name.
+    """
+    from collections import defaultdict
+
+    # Build PK index: pk_column_name → [table_names]  (only single-column PKs)
+    pk_index = defaultdict(list)
+    for t in proposed_tables:
+        tname = t.get("table_name", "")
+        pk_cols = [c["name"] for c in t.get("columns", []) if c.get("role", "").lower() == "pk"]
+        if len(pk_cols) == 1:
+            pk_index[pk_cols[0]].append(tname)
+
+    # Build set of existing relationship keys for fast lookup
+    existing_keys = set()
+    for r in existing_rels:
+        key = (r.get("from_table", ""), r.get("from_column", ""), r.get("to_table", ""), r.get("to_column", ""))
+        existing_keys.add(key)
+
+    # Build valid column sets per table
+    valid_cols = {t.get("table_name", ""): {c["name"] for c in t.get("columns", [])} for t in proposed_tables}
+
+    def _try_add(tname, cname, parent_table, parent_pk, match_type):
+        """Helper: add relationship if not already present and columns valid."""
+        key = (tname, cname, parent_table, parent_pk)
+        if key in existing_keys:
+            return False
+        if cname not in valid_cols.get(tname, set()):
+            return False
+        if parent_pk not in valid_cols.get(parent_table, set()):
+            return False
+        inferred.append({
+            "from_table": tname,
+            "from_column": cname,
+            "to_table": parent_table,
+            "to_column": parent_pk,
+            "cardinality": "1:N",
+            "description_english": f"Each {tname} record references one {parent_table} record via {cname}"
+        })
+        existing_keys.add(key)
+        print(f"[HEURISTIC] ✅ {match_type}: {tname}.{cname} → {parent_table}.{parent_pk}", flush=True)
+        return True
+
+    inferred = []
+    for t in proposed_tables:
+        tname = t.get("table_name", "")
+        for c in t.get("columns", []):
+            cname = c.get("name", "")
+            role = c.get("role", "").lower()
+            if role == "pk":
+                continue
+
+            # --- Strategy 1: EXACT match (order_id matches orders.order_id) ---
+            if cname.endswith("_id") and cname in pk_index:
+                for parent_table in pk_index[cname]:
+                    if parent_table != tname:
+                        _try_add(tname, cname, parent_table, cname, "EXACT")
+
+            # --- Strategy 2: SUFFIX match (origin_airport_id ends with airport_id) ---
+            # Only if exact match didn't fire. Check if column ends with any PK name.
+            if cname.endswith("_id") and cname not in pk_index:
+                for pk_col, parent_tables in pk_index.items():
+                    if not pk_col.endswith("_id"):
+                        continue
+                    # Column must end with _<pk_col> (e.g. origin_airport_id ends with _airport_id)
+                    # and have a prefix before the PK name
+                    if cname.endswith("_" + pk_col) and len(cname) > len(pk_col) + 1:
+                        for parent_table in parent_tables:
+                            if parent_table != tname:
+                                _try_add(tname, cname, parent_table, pk_col, "SUFFIX")
+
+    if inferred:
+        print(f"[HEURISTIC] Added {len(inferred)} relationships via column-name matching", flush=True)
+    else:
+        print(f"[HEURISTIC] No additional relationships found (LLM covered all patterns)", flush=True)
+    return inferred
+
+
+
+def _rescue_orphans_via_llm(proposed_tables, existing_rels, token, model_type="3nf"):
+    """LLM rescue pass: use Sonnet to find relationships for orphaned entities.
+
+    After the Opus Reduce and deterministic heuristic, some entities may still
+    have ZERO relationships — especially those with non-standard naming
+    (e.g. origin_airport instead of airport_id, airline_code instead of airline_id,
+    SAP-style Vendor_Code instead of vendor_id).
+
+    This function:
+    1. Identifies orphaned entities (entities with 0 incoming or outgoing rels)
+    2. Builds a MINI catalog containing only orphans + a PK reference index
+    3. Sends to Sonnet (fast, cheap) for targeted relationship inference
+    4. Validates and returns new relationships
+
+    Much smaller/cheaper than the full Reduce — typically <5K chars prompt.
+    """
+    # Find entities that participate in at least one relationship
+    connected = set()
+    for r in existing_rels:
+        connected.add(r.get("from_table", ""))
+        connected.add(r.get("to_table", ""))
+
+    # Orphans = entities with ZERO relationships
+    all_table_names = {t.get("table_name", "") for t in proposed_tables}
+    orphan_names = all_table_names - connected
+    if not orphan_names:
+        print("[RESCUE] No orphaned entities — all connected", flush=True)
+        return []
+
+    print(f"[RESCUE] Found {len(orphan_names)} orphaned entities: {', '.join(sorted(orphan_names)[:10])}{'...' if len(orphan_names) > 10 else ''}", flush=True)
+
+    # Build mini-catalog: full details for orphans, PK-only for connected entities
+    orphan_tables = [t for t in proposed_tables if t.get("table_name", "") in orphan_names]
+    connected_tables = [t for t in proposed_tables if t.get("table_name", "") in connected]
+
+    lines = ["ORPHANED ENTITIES (need relationships):"]
+    for t in orphan_tables:
+        tname = t.get("table_name", "unknown")
+        cols = t.get("columns", [])
+        pk_cols = [c["name"] for c in cols if c.get("role", "").lower() == "pk"]
+        other_cols = [f'{c["name"]} ({c.get("data_type", "STRING")})' for c in cols if c.get("role", "").lower() != "pk"]
+        lines.append(f"  Entity: {tname}")
+        if pk_cols:
+            lines.append(f"    PK: {', '.join(pk_cols)}")
+        if other_cols:
+            lines.append(f"    Columns: {', '.join(other_cols)}")
+
+    lines.append("")
+    lines.append("CONNECTED ENTITIES (potential parents/children — PK only):")
+    for t in connected_tables:
+        tname = t.get("table_name", "unknown")
+        cols = t.get("columns", [])
+        pk_cols = [c["name"] for c in cols if c.get("role", "").lower() == "pk"]
+        all_col_names = [c["name"] for c in cols]
+        if pk_cols:
+            lines.append(f"  Entity: {tname}  PK: {', '.join(pk_cols)}  Cols: {', '.join(all_col_names)}")
+
+    mini_catalog = "\n".join(lines)
+    print(f"[RESCUE] Mini-catalog: {len(mini_catalog):,} chars for {len(orphan_names)} orphans + {len(connected_tables)} connected", flush=True)
+
+    # Build focused prompt
+    prompt = f"""You are an expert data architect. I have entities that are DISCONNECTED (no relationships).
+Your task: find FK→PK relationships that connect them to the rest of the model.
+
+Look for SEMANTIC matches, not just naming conventions. Examples:
+- origin_airport / destination_airport → references airport entity (by airport_code or airport_id)
+- airline_code / carrier_code → references airline entity
+- Vendor_Code → references vendor entity
+- flight_id in bookings → references flight entity
+- Company_Code → references company entity
+
+{mini_catalog}
+
+For EACH orphaned entity, identify ALL FK relationships to connected entities.
+If an orphaned entity can also be a PARENT for another orphan, include that too.
+
+Return ONLY valid JSON:
+{{
+  "relationships": [
+    {{
+      "from_table": "child_entity",
+      "from_column": "fk_column",
+      "to_table": "parent_entity",
+      "to_column": "pk_column",
+      "cardinality": "1:N",
+      "description_english": "Each X references one Y"
+    }}
+  ]
+}}
+
+Return ONLY the JSON. No markdown fences. No extra text."""
+
+    print(f"[RESCUE] Prompt: {len(prompt):,} chars", flush=True)
+
+    # Use Sonnet (fast, cheap) — not Opus
+    try:
+        _refresh_endpoints_if_stale()
+        pools = _get_model_pools()
+        rescue_chain = pools["map"]["primary"] + pools["map"]["fallback"]
+        raw = _call_chat_model(prompt, token, max_tokens=8000, model_chain=rescue_chain)
+    except Exception as e:
+        print(f"[RESCUE] ⚠ LLM call failed: {e}", flush=True)
+        return []
+
+    # Parse and validate
+    parsed = _parse_llm_json_relationships(raw)
+    rescue_rels = parsed.get("relationships", []) if parsed else []
+
+    valid_tables = {t.get("table_name", ""): {c["name"] for c in t.get("columns", [])} for t in proposed_tables}
+    existing_keys = set()
+    for r in existing_rels:
+        existing_keys.add((r.get("from_table", ""), r.get("from_column", ""), r.get("to_table", ""), r.get("to_column", "")))
+
+    validated = []
+    for r in rescue_rels:
+        ft, fc = r.get("from_table", ""), r.get("from_column", "")
+        tt, tc = r.get("to_table", ""), r.get("to_column", "")
+        key = (ft, fc, tt, tc)
+        if key in existing_keys:
+            continue  # Already exists
+        if ft in valid_tables and tt in valid_tables:
+            if fc in valid_tables[ft] and tc in valid_tables[tt]:
+                validated.append(r)
+                existing_keys.add(key)
+                print(f"[RESCUE] ✅ {ft}.{fc} → {tt}.{tc}", flush=True)
+            else:
+                print(f"[RESCUE] ⚠ Dropped: {ft}.{fc} → {tt}.{tc} (column not found)", flush=True)
+        else:
+            print(f"[RESCUE] ⚠ Dropped: {ft} → {tt} (table not found)", flush=True)
+
+    print(f"[RESCUE] ✅ {len(validated)} new relationships rescued via Sonnet", flush=True)
+    return validated
+
+
+def _map_global_relationships(proposed_tables, catalog, schema, token, model_type="3nf", progress_cb=None):
+    """Reduce phase: Use best Opus to infer all FK→PK relationships globally.
 
     Takes the merged Map output (all proposed entities), compresses it
-    into a structure-only catalog, and sends to Opus via race mode.
+    into a structure-only catalog, and sends to the best Opus endpoint
+    (single call — no racing to save cost).
     Returns the relationships list and injects FK roles into columns.
     """
+    _step = progress_cb or (lambda msg, **kw: None)
+
     # Build compressed catalog
     catalog_text = _build_schema_catalog(proposed_tables)
     print(f"[REDUCE] Schema catalog: {len(catalog_text):,} chars for {len(proposed_tables)} entities", flush=True)
@@ -945,16 +1190,24 @@ def _map_global_relationships(proposed_tables, catalog, schema, token, model_typ
     prompt = _build_reduce_prompt(catalog_text, catalog, schema, model_type)
     print(f"[REDUCE] Prompt: {len(prompt):,} chars", flush=True)
 
-    # Race all Opus endpoints
-    raw = _call_chat_model_race(prompt, token, max_tokens=MAX_TOKENS_SINGLE)
+    # Single Opus call (best available — no racing to save cost)
+    pools = _get_model_pools()
+    reduce_models = pools["reduce"]["primary"][:1] + pools["reduce"]["fallback"]
+    _short = lambda m: m.replace("databricks-claude-", "")
+    _step(f"🧠 Calling {_short(reduce_models[0])} for global FK→PK mapping...")
+    raw = _call_chat_model(prompt, token, max_tokens=MAX_TOKENS_SINGLE, model_chain=reduce_models)
+    _step(f"🏆 {_short(reduce_models[0])} responded — {len(raw):,} chars")
 
     # Parse relationships
+    _step("🔍 Parsing relationship JSON...")
     parsed = _parse_llm_json_relationships(raw)
     rels = parsed.get("relationships", []) if parsed else []
 
     # Validate: drop relationships pointing to non-existent tables/columns
+    _step(f"✅ Validating {len(rels)} proposed relationships against entity schema...")
     valid_tables = {t.get("table_name", ""): {c["name"] for c in t.get("columns", [])} for t in proposed_tables}
     validated = []
+    dropped = 0
     for r in rels:
         ft = r.get("from_table", "")
         fc = r.get("from_column", "")
@@ -964,11 +1217,41 @@ def _map_global_relationships(proposed_tables, catalog, schema, token, model_typ
             if fc in valid_tables[ft] and tc in valid_tables[tt]:
                 validated.append(r)
             else:
+                dropped += 1
                 print(f"[REDUCE] ⚠ Dropped rel: {ft}.{fc} → {tt}.{tc} (column not found)", flush=True)
         else:
+            dropped += 1
             print(f"[REDUCE] ⚠ Dropped rel: {ft} → {tt} (table not found)", flush=True)
 
-    print(f"[REDUCE] ✅ {len(validated)} valid relationships (dropped {len(rels) - len(validated)})", flush=True)
+    print(f"[REDUCE] ✅ {len(validated)} valid relationships (dropped {dropped})", flush=True)
+    _step(f"✅ {len(validated)} valid LLM relationships ({dropped} dropped)", status="done")
+
+    # Heuristic FK detection: catch obvious column-name matches the LLM missed
+    _step("🔗 Running heuristic FK detection (exact + suffix matching)...")
+    heuristic_rels = _infer_heuristic_fks(proposed_tables, validated)
+    if heuristic_rels:
+        validated.extend(heuristic_rels)
+        print(f"[REDUCE] ✅ Total after heuristic: {len(validated)} relationships", flush=True)
+        _step(f"🔗 Heuristic found {len(heuristic_rels)} additional FK matches", status="done")
+    else:
+        _step("🔗 Heuristic: no additional matches (LLM caught them all)", status="done")
+
+    # LLM rescue pass: use Sonnet to find relationships for orphaned entities
+    # (entities with 0 relationships after Opus + heuristic — catches semantic
+    # patterns like origin_airport→airport, airline_code→airline, Vendor_Code→vendor)
+    _step("🔍 Scanning for orphaned entities...")
+    try:
+        rescue_rels = _rescue_orphans_via_llm(proposed_tables, validated, token, model_type)
+        if rescue_rels:
+            validated.extend(rescue_rels)
+            print(f"[REDUCE] ✅ Total after rescue: {len(validated)} relationships", flush=True)
+            _step(f"🚑 Rescue pass connected {len(rescue_rels)} orphaned entities", status="done")
+        else:
+            _step("🔍 No orphaned entities found — all connected", status="done")
+    except Exception as rescue_err:
+        print(f"[RESCUE] ⚠ Rescue pass failed (non-fatal): {rescue_err}", flush=True)
+        _step(f"⚠ Rescue pass failed: {str(rescue_err)[:60]} (non-fatal)", status="error")
+
     return validated
 
 
@@ -1419,10 +1702,11 @@ def _bg_generate(catalog, schema, model_type, token):
             _check_cancelled()
 
             # Step 4: Reduce — Global relationship mapping via Opus
-            _add_step(f"🧠 Reduce phase — racing Opus endpoints for global FK→PK mapping...")
+            _add_step(f"🧠 Reduce phase — calling best Opus for global FK→PK mapping...")
             try:
                 relationships = _map_global_relationships(
-                    model.get("proposed_tables", []), catalog, schema, token, model_type
+                    model.get("proposed_tables", []), catalog, schema, token, model_type,
+                    progress_cb=_add_step
                 )
                 model["relationships"] = relationships
 
@@ -1435,7 +1719,7 @@ def _bg_generate(catalog, schema, model_type, token):
                                     c["role"] = "fk"
 
                 r_count = len(relationships)
-                _add_step(f"✅ Reduce complete — {r_count} relationships mapped via Opus", status="done")
+                _add_step(f"✅ Reduce complete — {r_count} relationships mapped (Opus + heuristic + LLM rescue)", status="done")
                 print(f"[REDUCE] ✅ {r_count} relationships injected", flush=True)
             except Exception as reduce_err:
                 print(f"[REDUCE] ⚠ Reduce phase failed: {reduce_err}", flush=True)
@@ -1467,35 +1751,154 @@ def _bg_generate(catalog, schema, model_type, token):
 # ERD VISUALIZATION BUILDER
 # =============================================================================
 
+def _detect_domain_clusters(tables, relationships):
+    """Detect connected components (domain clusters) using BFS on relationships.
+
+    Returns dict: table_name -> cluster_id (int starting from 0).
+    Each connected component = one domain cluster.
+    Isolated nodes (no relationships) get their own cluster.
+    """
+    # Build adjacency list
+    adj = defaultdict(set)
+    table_names = {t.get("table_name", "") for t in tables}
+    for r in relationships:
+        ft = r.get("from_table", "")
+        tt = r.get("to_table", "")
+        if ft in table_names and tt in table_names:
+            adj[ft].add(tt)
+            adj[tt].add(ft)
+
+    # BFS to find connected components
+    visited = set()
+    clusters = {}  # table_name -> cluster_id
+    cluster_id = 0
+
+    for t in tables:
+        tname = t.get("table_name", "")
+        if tname in visited:
+            continue
+        # BFS from this node
+        queue = [tname]
+        component = []
+        while queue:
+            node = queue.pop(0)
+            if node in visited:
+                continue
+            visited.add(node)
+            component.append(node)
+            for neighbor in adj.get(node, set()):
+                if neighbor not in visited:
+                    queue.append(neighbor)
+        for node in component:
+            clusters[node] = cluster_id
+        cluster_id += 1
+
+    return clusters, cluster_id
+
+
+# Domain cluster label seeds — try to name clusters by their dominant entity
+_DOMAIN_KEYWORDS = {
+    "flight": "Aviation", "airline": "Aviation", "airport": "Aviation", "booking": "Aviation",
+    "passenger": "Aviation", "ticket": "Aviation",
+    "order": "Orders", "restaurant": "Orders", "delivery": "Orders", "payment": "Orders",
+    "menu": "Orders", "driver": "Orders", "food": "Orders",
+    "procurement": "Procurement", "contract": "Procurement", "vendor": "Procurement",
+    "invoice": "Procurement", "purchase": "Procurement",
+    "customer": "Customers", "user": "Customers", "account": "Customers",
+    "product": "Products", "item": "Products", "inventory": "Products",
+    "employee": "HR", "department": "HR", "salary": "HR",
+    "agent": "Agent/ML", "evaluation": "Agent/ML", "model": "Agent/ML",
+    "trace": "Agent/ML", "metric": "Agent/ML",
+}
+
+
+def _name_cluster(table_names):
+    """Try to give a domain-meaningful name to a cluster based on its table names."""
+    # Count domain keyword matches
+    domain_votes = defaultdict(int)
+    for tname in table_names:
+        for keyword, domain in _DOMAIN_KEYWORDS.items():
+            if keyword in tname.lower():
+                domain_votes[domain] += 1
+    if domain_votes:
+        return max(domain_votes, key=domain_votes.get)
+    # Fall back to first table name
+    return table_names[0] if table_names else "cluster"
+
+
 def build_proposed_erd_elements(model):
-    """Build Cytoscape elements from LLM model proposal."""
+    """Build Cytoscape elements from LLM model proposal with domain clustering.
+
+    Uses connected component detection to group related entities into
+    compound parent nodes. This makes fcose layout place each domain
+    cluster together and separate unrelated domains visually.
+    """
     elements = []
     if not model:
         return elements
 
+    tables = model.get("proposed_tables", [])
+    relationships = model.get("relationships", [])
+
+    # Detect domain clusters (connected components)
+    clusters, num_clusters = _detect_domain_clusters(tables, relationships)
+
+    # Build cluster -> table_names mapping
+    cluster_tables = defaultdict(list)
+    for t in tables:
+        tname = t.get("table_name", "")
+        cid = clusters.get(tname, 0)
+        cluster_tables[cid].append(tname)
+
+    # Only create compound parents if there are multiple clusters with >1 node
+    multi_node_clusters = {cid: names for cid, names in cluster_tables.items() if len(names) > 1}
+    use_compound = len(multi_node_clusters) > 1 or (len(multi_node_clusters) == 1 and len(cluster_tables) > len(multi_node_clusters))
+
+    # Add compound parent nodes for each cluster (if clustering is useful)
+    cluster_parent_ids = {}
+    if use_compound:
+        for cid, table_names in cluster_tables.items():
+            parent_id = f"__cluster_{cid}"
+            cluster_parent_ids[cid] = parent_id
+            domain_name = _name_cluster(table_names)
+            elements.append({
+                "data": {
+                    "id": parent_id,
+                    "label": f"{domain_name} ({len(table_names)})" if len(table_names) > 1 else "",
+                },
+                "classes": "compound-node",
+            })
+
     # Nodes — one per proposed table
-    for t in model.get("proposed_tables", []):
+    for t in tables:
         tname = t.get("table_name", "unknown")
         ttype = t.get("table_type", "core_entity").lower()
         col_count = len(t.get("columns", []))
         color = COLORS.get(ttype, COLORS["attribute"])
 
+        node_data = {
+            "id": tname,
+            "label": f"{tname}\n({col_count} cols)",
+            "table_type": ttype,
+            "color": color,
+            "description": t.get("description", ""),
+            "columns": json.dumps(t.get("columns", [])),
+            "source_tables": json.dumps(t.get("source_tables", [])),
+        }
+
+        # Assign to compound parent if clustering is active
+        cid = clusters.get(tname, 0)
+        if use_compound and cid in cluster_parent_ids:
+            node_data["parent"] = cluster_parent_ids[cid]
+
         elements.append({
-            "data": {
-                "id": tname,
-                "label": f"{tname}\n({col_count} cols)",
-                "table_type": ttype,
-                "color": color,
-                "description": t.get("description", ""),
-                "columns": json.dumps(t.get("columns", [])),
-                "source_tables": json.dumps(t.get("source_tables", [])),
-            },
+            "data": node_data,
             "classes": ttype,
         })
 
     # Edges — consolidated: ONE per table pair
     edge_map = defaultdict(list)  # (from_table, to_table) -> [relationships]
-    for r in model.get("relationships", []):
+    for r in relationships:
         ft = r.get("from_table", "")
         tt = r.get("to_table", "")
         if ft and tt:
@@ -1505,171 +1908,22 @@ def build_proposed_erd_elements(model):
     for (t1, t2), rels in edge_map.items():
         # Use first relationship's direction
         first = rels[0]
-        label = first.get("cardinality", "")
-        if len(rels) > 1:
-            label += f" ({len(rels)} rels)"
 
-        elements.append({
-            "data": {
-                "id": f"edge_{first.get('from_table', 'x')}_{first.get('to_table', 'y')}",
-                "source": first.get("from_table", ""),
-                "target": first.get("to_table", ""),
-                "label": label,
-                "description": first.get("description_english", ""),
-                "rel_count": len(rels),
-                "all_rels": json.dumps(rels),
-            }
-        })
-
-    return elements
-
-
-def get_cytoscape_stylesheet():
-    """Professional ERD stylesheet — clean, business-friendly, presentation-ready."""
-    return [
-        # --- Default Node: Clean card-style entity box ---
-        {
-            "selector": "node",
-            "style": {
-                "label": "data(label)",
-                "text-wrap": "wrap",
-                "text-valign": "center",
-                "text-halign": "center",
-                "font-size": "12px",
-                "font-family": "'Inter', 'Segoe UI', -apple-system, sans-serif",
-                "font-weight": "600",
-                "color": "#ffffff",
-                "background-color": "data(color)",
-                "shape": "round-rectangle",
-                "width": 220,
-                "height": 60,
-                "border-width": 2.5,
-                "border-color": "#cbd5e1",
-                "border-opacity": 1,
-                "text-max-width": 200,
-                "padding": "8px",
-                # Shadow effect via overlay
-                "overlay-opacity": 0,
-                "shadow-blur": 12,
-                "shadow-color": "#00000020",
-                "shadow-offset-x": 0,
-                "shadow-offset-y": 4,
-                "shadow-opacity": 0.3,
-            },
-        },
-        # --- 3NF Entity types ---
-        {"selector": ".core_entity", "style": {"background-color": COLORS["core_entity"], "border-color": "#1e40af", "border-width": 3}},
-        {"selector": ".weak_entity", "style": {"background-color": COLORS["weak_entity"], "border-color": "#0284c7", "border-style": "dashed", "border-width": 2.5}},
-        {"selector": ".associative", "style": {"background-color": COLORS["associative"], "border-color": "#ea580c", "border-width": 2.5}},
-        {"selector": ".reference", "style": {"background-color": COLORS["reference"], "border-color": "#475569", "border-width": 2, "border-style": "dotted"}},
-        # --- Dimensional Entity types ---
-        {"selector": ".fact", "style": {"background-color": COLORS["fact"], "border-color": "#1d4ed8", "border-width": 3.5}},
-        {"selector": ".dimension", "style": {"background-color": COLORS["dimension"], "border-color": "#15803d", "border-width": 2.5}},
-        {"selector": ".bridge", "style": {"background-color": COLORS["bridge"], "border-color": "#c2410c", "border-width": 2.5, "border-style": "dashed"}},
-        {"selector": ".aggregate", "style": {"background-color": COLORS["aggregate"], "border-color": "#6d28d9", "border-width": 2.5, "border-style": "dotted"}},
-        # --- Edges: Professional relationship lines ---
-        {
-            "selector": "edge",
-            "style": {
-                "label": "data(label)",
-                "curve-style": "bezier",
-                "target-arrow-shape": "triangle",
-                "target-arrow-color": "#64748b",
-                "target-arrow-fill": "filled",
-                "arrow-scale": 1.2,
-                "line-color": "#94a3b8",
-                "line-style": "solid",
-                "width": 2,
-                "font-size": "10px",
-                "font-family": "'Inter', 'Segoe UI', sans-serif",
-                "font-weight": "600",
-                "color": "#475569",
-                "text-rotation": "autorotate",
-                "text-margin-y": -12,
-                "text-background-color": "#f8fafc",
-                "text-background-opacity": 0.9,
-                "text-background-padding": "3px",
-                "text-background-shape": "roundrectangle",
-            },
-        },
-        # --- Hover: subtle highlight ---
-        {
-            "selector": "node:active",
-            "style": {
-                "overlay-color": "#facc15",
-                "overlay-opacity": 0.15,
-            },
-        },
-        # --- Selected: gold highlight ---
-        {
-            "selector": "node:selected",
-            "style": {
-                "border-width": 4,
-                "border-color": "#facc15",
-                "shadow-blur": 20,
-                "shadow-color": "#facc1540",
-                "shadow-opacity": 0.6,
-            },
-        },
-        # --- Connected edges highlight on node select ---
-        {
-            "selector": "edge:selected",
-            "style": {
-                "line-color": "#2563eb",
-                "target-arrow-color": "#2563eb",
-                "width": 3,
-            },
-        },
-        # --- Dimmed (for search filter) ---
-        {
-            "selector": ".dimmed",
-            "style": {
-                "opacity": 0.15,
-            },
-        },
-    ]
-
-def build_proposed_erd_elements(model):
-    """Build Cytoscape elements from LLM model proposal."""
-    elements = []
-    if not model:
-        return elements
-
-    # Nodes — one per proposed table
-    for t in model.get("proposed_tables", []):
-        tname = t.get("table_name", "unknown")
-        ttype = t.get("table_type", "core_entity").lower()
-        col_count = len(t.get("columns", []))
-        color = COLORS.get(ttype, COLORS["attribute"])
-
-        elements.append({
-            "data": {
-                "id": tname,
-                "label": f"{tname}\n({col_count} cols)",
-                "table_type": ttype,
-                "color": color,
-                "description": t.get("description", ""),
-                "columns": json.dumps(t.get("columns", [])),
-                "source_tables": json.dumps(t.get("source_tables", [])),
-            },
-            "classes": ttype,
-        })
-
-    # Edges — consolidated: ONE per table pair
-    edge_map = defaultdict(list)  # (from_table, to_table) -> [relationships]
-    for r in model.get("relationships", []):
-        ft = r.get("from_table", "")
-        tt = r.get("to_table", "")
-        if ft and tt:
-            key = tuple(sorted([ft, tt]))
-            edge_map[key].append(r)
-
-    for (t1, t2), rels in edge_map.items():
-        # Use first relationship's direction
-        first = rels[0]
-        label = first.get("cardinality", "")
-        if len(rels) > 1:
-            label += f" ({len(rels)} rels)"
+        # Build label: cardinality + column names on the arrow
+        # e.g. "1:N  order_id" or "1:N  origin_airport_id → airport_id"
+        label_parts = []
+        for r in rels:
+            fc = r.get("from_column", "")
+            tc = r.get("to_column", "")
+            card = r.get("cardinality", "")
+            if fc and tc:
+                if fc == tc:
+                    label_parts.append(f"{card}  {fc}")
+                else:
+                    label_parts.append(f"{card}  {fc} → {tc}")
+            else:
+                label_parts.append(card)
+        label = "\n".join(label_parts)
 
         elements.append({
             "data": {
@@ -1728,10 +1982,17 @@ def get_cytoscape_stylesheet():
                 "target-arrow-color": "#94a3b8",
                 "line-color": "#475569",
                 "width": 2,
-                "font-size": "9px",
-                "color": "#94a3b8",
+                "font-size": "8px",
+                "font-family": "'SF Mono', 'Cascadia Code', 'Fira Code', monospace",
+                "color": "#64748b",
+                "text-wrap": "wrap",
+                "text-max-width": 200,
                 "text-rotation": "autorotate",
                 "text-margin-y": -10,
+                "text-background-color": "#f8fafc",
+                "text-background-opacity": 0.85,
+                "text-background-padding": "3px",
+                "text-background-shape": "roundrectangle",
             },
         },
         # Selected/hovered
@@ -1749,6 +2010,26 @@ def get_cytoscape_stylesheet():
                 "opacity": 0.2,
             },
         },
+        # Compound parent nodes (domain clusters)
+        {
+            "selector": ".compound-node",
+            "style": {
+                "background-color": "#f1f5f9",
+                "background-opacity": 0.65,
+                "border-width": 2,
+                "border-color": "#cbd5e1",
+                "border-style": "dashed",
+                "shape": "round-rectangle",
+                "padding": "30px",
+                "text-valign": "top",
+                "text-halign": "center",
+                "font-size": "13px",
+                "font-weight": "bold",
+                "color": "#64748b",
+                "text-margin-y": 8,
+                "label": "data(label)",
+            },
+        },
     ]
 
 
@@ -1764,12 +2045,12 @@ def build_summary_panel(model):
 
     sections = []
 
-    # --- Business Data Summary card ---
+    # --- Business Domain Overview card ---
     summary = model.get("data_summary", "")
     if summary:
         sections.append(
             html.Div([
-                html.H3(["\U0001f4cb Business Data Summary"], className="card-title"),
+                html.H3(["\U0001f4cb Business Domain Overview"], className="card-title"),
                 html.P(summary, style={"color": "#334155", "lineHeight": "1.8", "fontSize": "14px"}),
             ], className="summary-card")
         )
@@ -2110,8 +2391,8 @@ def _generate_consulting_report(model):
     # EXECUTIVE SUMMARY
     # ==========================================
     pdf.add_page()
-    section_title("01", "Executive Summary")
-    body_text(summary_text or "No data summary available.", 9)
+    section_title("01", "Business Domain Overview")
+    body_text(summary_text or "No business domain overview available.", 9)
 
 
     # Type distribution
@@ -2459,10 +2740,7 @@ app.layout = html.Div(
                             id="erd-graph",
                             elements=[],
                             stylesheet=get_cytoscape_stylesheet(),
-                            layout={"name": "cola", "animate": False, "randomize": True,
-                                    "nodeSpacing": 100, "edgeLengthVal": 200,
-                                    "maxSimulationTime": 4000, "convergenceThreshold": 0.001,
-                                    "fit": True, "padding": 50},
+                            layout={"name": "fcose", "animate": False, "randomize": True, "quality": "proof", "nodeRepulsion": 15000, "idealEdgeLength": 250, "edgeElasticity": 0.35, "componentSpacing": 400, "nestingFactor": 0.1, "gravity": 0.08, "gravityRange": 5.0, "fit": True, "padding": 80},
                             style={"width": "100%", "height": "calc(100vh - 160px)",
                                    "backgroundColor": "#f8fafc"},
                         ),
@@ -2728,7 +3006,12 @@ def poll_progress(n):
             model["_model_type"] = _job.get("_model_type", "3nf")
             elements = build_proposed_erd_elements(model)
             summary = build_summary_panel(model)
-            _cola = {"name": "cola", "animate": False, "randomize": True, "nodeSpacing": 100, "edgeLengthVal": 200, "maxSimulationTime": 4000, "convergenceThreshold": 0.001, "fit": True, "padding": 50}
+            # Dynamic layout: scale repulsion & spacing based on entity count
+            _n = len(elements)
+            _repulsion = max(15000, _n * 200)   # More entities → more repulsion
+            _spacing = max(400, _n * 5)          # More entities → more inter-cluster spacing
+            _edge_len = max(250, _n * 3)         # More entities → longer edges
+            _cola = {"name": "fcose", "animate": False, "randomize": True, "quality": "proof", "nodeRepulsion": _repulsion, "idealEdgeLength": _edge_len, "edgeElasticity": 0.35, "componentSpacing": _spacing, "nestingFactor": 0.1, "gravity": 0.08, "gravityRange": 5.0, "fit": True, "padding": 80}
             return step_items, elapsed, elements, _cola, summary, model, False, {"display": "none"}, True
         elif _job.get("error"):
             err_msg = _job["error"]
